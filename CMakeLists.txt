@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.21)
+project(ZoruMiner VERSION 0.1.0 LANGUAGES CXX)
+find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin" REQUIRED)
+set(ZORU_CARGO_TARGET_DIR "${CMAKE_CURRENT_SOURCE_DIR}/miner/target" CACHE PATH "Rust build directory")
+set(ZORU_CLI_BINARY "${ZORU_CARGO_TARGET_DIR}/release/zoru-miner-cli${CMAKE_EXECUTABLE_SUFFIX}")
+file(GLOB_RECURSE ZORU_RUST_SOURCES CONFIGURE_DEPENDS "miner/src/*.rs")
+add_custom_command(OUTPUT "${ZORU_CLI_BINARY}"
+  COMMAND ${CMAKE_COMMAND} -E env "CARGO_BUILD_JOBS=1" "CARGO_TARGET_DIR=${ZORU_CARGO_TARGET_DIR}" "${CARGO_EXECUTABLE}" build --release --locked --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/miner/Cargo.toml"
+  DEPENDS ${ZORU_RUST_SOURCES} miner/Cargo.toml miner/Cargo.lock rust-toolchain.toml
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+add_custom_target(zoru-cli ALL
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ZORU_CLI_BINARY}" "${CMAKE_CURRENT_BINARY_DIR}/zoru-miner-cli${CMAKE_EXECUTABLE_SUFFIX}"
+  DEPENDS "${ZORU_CLI_BINARY}" VERBATIM)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_AUTOMOC ON)
+find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets)
+add_library(zoru-window app/src/Window.cpp app/src/Window.h)
+target_link_libraries(zoru-window PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets)
+target_include_directories(zoru-window PUBLIC app/src)
+add_executable(zoru-miner-gui app/src/main.cpp)
+target_link_libraries(zoru-miner-gui PRIVATE zoru-window)
+add_dependencies(zoru-miner-gui zoru-cli)
+include(CTest)
+if(BUILD_TESTING)
+  find_package(Qt6 REQUIRED COMPONENTS Test Network)
+  add_executable(zoru-gui-tests app/tests/SmokeTest.cpp)
+  add_dependencies(zoru-gui-tests zoru-cli)
+  target_link_libraries(zoru-gui-tests PRIVATE zoru-window Qt6::Test Qt6::Network)
+  add_test(NAME gui-transport COMMAND zoru-gui-tests)
+  set_tests_properties(gui-transport PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
+install(TARGETS zoru-miner-gui RUNTIME DESTINATION bin)
+install(PROGRAMS "${ZORU_CLI_BINARY}" DESTINATION bin)

@@ -1,0 +1,33 @@
+[package]
+name = "zoru-miner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+
+[[bin]]
+name = "zoru-miner-cli"
+path = "src/main.rs"
+
+[dependencies]
+alloy-consensus = { version = "=2.5.0", features = ["k256"] }
+alloy-eips = "=2.5.0"
+alloy-primitives = { version = "=1.6.0", features = ["serde", "k256"] }
+alloy-signer = "=2.5.0"
+alloy-signer-local = { version = "=2.5.0", features = ["keystore", "zeroize"] }
+anyhow = "=1.0.104"
+clap = { version = "=4.5.50", features = ["derive"] }
+ctrlc = "=3.5.0"
+fs2 = "=0.4.3"
+hex = "=0.4.3"
+libc = "0.2"
+rand = "=0.8.6"
+reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "=7.4.0"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tempfile = "3"
+tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
+zeroize = "=1.8.2"
