@@ -6,7 +6,17 @@ The ZORU Miner is a Rust proof-of-work application with a Qt desktop and command
 
 ## Install or build
 
-Linux x86_64 requires glibc 2.34+ and Qt 6.2+. Source builds use Rust 1.94.1 and CMake 3.21+.
+Linux x86_64 requires glibc 2.34+ and Qt 6.2+. Windows x64 builds use Microsoft Visual C++ and Qt 6. Source builds use Rust 1.94.1 and CMake 3.21+.
+
+### Install
+
+Download the build for your operating system from [GitHub Releases](https://github.com/zoruco/zoru-miner/releases/tag/v0.1.0).
+
+- **Debian/Ubuntu:** install the `.deb` using `sudo apt install ./zoru-miner-v0.1.0-linux-amd64.deb`.
+- **Windows x64:** run `zoru-miner-v0.1.0-windows-x64-setup.exe`, or extract the portable `.zip`.
+- **Linux portable:** extract the `.tar.gz`. The Qt GUI and Rust CLI are in `bin/`.
+
+Verify the release SHA-256 checksums before installation. The Windows installer is not code-signed, so Windows SmartScreen may display a warning. The mainnet manifest is included with each package; you will need an encrypted keystore wallet to mine. Never share the wallet password.
 
 ```sh
 cargo build --release --locked --manifest-path miner/Cargo.toml
