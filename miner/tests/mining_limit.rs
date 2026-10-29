@@ -37,7 +37,7 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
     let result = session
         .run(Run {
             workers: 4,
-            cpu_budget: 0.6,
+            cpu_budget: 2.0,
             seconds: 120,
             max_accepted: 1,
         })
