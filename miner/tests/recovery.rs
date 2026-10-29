@@ -40,6 +40,7 @@ fn prepared(
         raw: format!("0x{}", hex::encode(raw)),
         state: "prepared".into(),
         label: "recovery-regression".into(),
+        beacon_epoch: None,
         receipt: None,
         replacement: None,
     }

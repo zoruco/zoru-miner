@@ -152,8 +152,31 @@ pub struct Journal {
     pub raw: String,
     pub state: String,
     pub label: String,
+    /// Epoch of a signed drand publication, retained for safe recovery.
+    #[serde(default)]
+    pub beacon_epoch: Option<u64>,
     pub receipt: Option<Value>,
     pub replacement: Option<B256>,
+}
+
+/// Never discard a signed journal solely because the RPC rejected it.
+/// A competing miner may have published the same beacon: archive the obsolete
+/// transaction only after confirming the original hash is absent, the nonce
+/// is unchanged on both chain views, and the exact epoch is cached on-chain.
+fn obsolete_beacon_journal(
+    entry: &Journal,
+    latest_nonce: u64,
+    pending_nonce: u64,
+    transaction_known: bool,
+    seed_verified: bool,
+) -> bool {
+    entry.label == "publish-drand"
+        && entry.state == "prepared"
+        && entry.beacon_epoch.is_some()
+        && entry.nonce == latest_nonce
+        && entry.nonce == pending_nonce
+        && !transaction_known
+        && seed_verified
 }
 
 pub struct Client {
@@ -530,7 +553,7 @@ impl Client {
                 entry.chain_id == CHAIN && entry.account == account,
                 "Journal network or account mismatch"
             );
-            if entry.state == "replaced" {
+            if matches!(entry.state.as_str(), "replaced" | "superseded-beacon") {
                 self.archive_journal(&entry)?;
                 continue;
             }
@@ -615,10 +638,39 @@ impl Client {
                 self.write_journal(&entry)?;
                 continue;
             }
-            let _ = self
+            if let Some(epoch) = entry.beacon_epoch
+                && entry.label == "publish-drand"
+                && entry.state == "prepared"
+            {
+                let latest = self.nonce(account, "latest")?;
+                let pending = self.nonce(account, "pending")?;
+                if latest == entry.nonce && pending == entry.nonce {
+                    let known = !self
+                        .read
+                        .request("eth_getTransactionByHash", json!([entry.hash]))?
+                        .is_null();
+                    if !known {
+                        let seed_verified = abi::scalar(&self.call(
+                            self.manifest.beacon,
+                            "verifiedSeed(uint48)",
+                            &[abi::uint(U256::from(epoch))],
+                        )?)? != U256::ZERO;
+                        if obsolete_beacon_journal(&entry, latest, pending, known, seed_verified) {
+                            entry.state = "superseded-beacon".into();
+                            self.write_journal(&entry)?;
+                            self.archive_journal(&entry)?;
+                            continue;
+                        }
+                    }
+                }
+            }
+            let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([entry.raw]));
-            let receipt = self.receipt(entry.hash, Duration::from_secs(35))?;
+            let receipt = match self.receipt(entry.hash, Duration::from_secs(35)) {
+                Ok(receipt) => receipt,
+                Err(receipt_error) => return Err(broadcast.err().unwrap_or(receipt_error)),
+            };
             entry.state = "confirmed".into();
             entry.receipt = Some(receipt);
             self.write_journal(&entry)?;
@@ -692,6 +744,19 @@ impl Client {
         let envelope = TxEnvelope::from(tx.into_signed(signature));
         let raw = envelope.encoded_2718();
         let hash = abi::keccak(&raw);
+        let beacon_epoch = if label == "publish-drand" {
+            let input = abi::bytes(&data)?;
+            ensure!(
+                to == self.manifest.beacon
+                    && input.len() == 164
+                    && input.starts_with(&[0xa9, 0xe9, 0x12, 0x97])
+                    && input[4..28].iter().all(|byte| *byte == 0),
+                "Unexpected drand publication calldata"
+            );
+            Some(u64::from_be_bytes(input[28..36].try_into()?))
+        } else {
+            None
+        };
         let mut record = Journal {
             chain_id: CHAIN,
             account,
@@ -700,6 +765,7 @@ impl Client {
             raw: format!("0x{}", hex::encode(raw)),
             state: "prepared".into(),
             label: label.into(),
+            beacon_epoch,
             receipt: None,
             replacement: None,
         };
@@ -707,7 +773,7 @@ impl Client {
         let started = Instant::now();
         let mut result = None;
         for attempt in 0..2 {
-            let _ = self
+            let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([record.raw]));
             match self.receipt(hash, Duration::from_secs(35)) {
@@ -715,7 +781,9 @@ impl Client {
                     result = Some(value);
                     break;
                 }
-                Err(e) if attempt == 1 => return Err(e),
+                Err(receipt_error) if attempt == 1 => {
+                    return Err(broadcast.err().unwrap_or(receipt_error));
+                }
                 Err(_) => {}
             }
         }
@@ -747,6 +815,41 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn obsolete_beacon_journal_requires_proven_external_publication() {
+        let mut entry = Journal {
+            chain_id: CHAIN,
+            account: Address::repeat_byte(0x85),
+            nonce: 5,
+            hash: B256::repeat_byte(0x12),
+            raw: "0x00".into(),
+            state: "prepared".into(),
+            label: "publish-drand".into(),
+            beacon_epoch: Some(0),
+            receipt: None,
+            replacement: None,
+        };
+        assert!(obsolete_beacon_journal(&entry, 5, 5, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 4, 5, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 5, 6, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, true));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, false));
+        entry.beacon_epoch = None;
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
+        entry.beacon_epoch = Some(0);
+        entry.state = "confirmed".into();
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
+        entry.state = "prepared".into();
+        entry.label = "mined-proof".into();
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
+
+        // Journals written before this patch must deserialize unchanged.
+        let mut old = serde_json::to_value(&entry).unwrap();
+        old.as_object_mut().unwrap().remove("beacon_epoch");
+        let restored: Journal = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.beacon_epoch, None);
+    }
+
     #[test]
     fn only_exact_invalid_epoch_selector_is_a_boundary_candidate() {
         assert!(is_epoch_boundary_revert(&anyhow::anyhow!(
