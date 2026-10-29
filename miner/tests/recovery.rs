@@ -10,9 +10,92 @@ use std::{fs, path::PathBuf, time::Duration};
 use zeroize::Zeroizing;
 use zoru_miner::{
     abi, pow,
-    protocol::{CHAIN, Client, GAS_PRICE, Journal, Manifest},
+    protocol::{CHAIN, Client, Journal, Manifest},
     storage, wallet,
 };
+
+const GAS_PRICE: u128 = 150_000_000_000;
+
+#[test]
+#[ignore = "requires an isolated Anvil deployment and disposable encrypted wallet"]
+fn rpc_fee_quote_is_signed_and_total_fee_budget_blocks_excessive_quotes() {
+    let options: Value = serde_json::from_slice(
+        &fs::read(std::env::var("ZORU_TEST_OPTIONS").expect("ZORU_TEST_OPTIONS")).unwrap(),
+    )
+    .unwrap();
+    let manifest = Manifest::load(&PathBuf::from(options["manifest"].as_str().unwrap())).unwrap();
+    assert_eq!(manifest.mode, "local");
+    let signer = wallet::unlock(
+        &PathBuf::from(options["wallet"].as_str().unwrap()),
+        Zeroizing::new(options["password"].as_str().unwrap().to_owned()),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let c = Client::new(
+        manifest,
+        options["read"].as_str().unwrap(),
+        options["submit"].as_str().unwrap(),
+        "http://127.0.0.1:1",
+        dir.path().join("journal"),
+        dir.path().join("receipts"),
+    )
+    .unwrap();
+    c.verify().unwrap();
+    let set_base = |price: u128| {
+        c.read
+            .request(
+                "anvil_setNextBlockBaseFeePerGas",
+                json!([format!("0x{price:x}")]),
+            )
+            .unwrap();
+        c.read.request("evm_mine", json!([])).unwrap();
+    };
+    set_base(GAS_PRICE * 2);
+    let quote = c.gas_price().unwrap();
+    assert!(
+        quote > GAS_PRICE,
+        "fixture must reject the former fixed price"
+    );
+    let data = abi::call(
+        "openEpoch(uint48)",
+        &[abi::uint(U256::from(c.epoch().unwrap()))],
+    );
+    let receipt = c
+        .send(&signer, "fee-quote", c.manifest.ledger, data.clone(), None)
+        .unwrap();
+    let tx = c
+        .read
+        .request(
+            "eth_getTransactionByHash",
+            json!([receipt["transactionHash"]]),
+        )
+        .unwrap();
+    assert_eq!(
+        abi::quantity(tx["gasPrice"].as_str().unwrap()).unwrap(),
+        U256::from(quote)
+    );
+    assert_eq!(receipt["status"], "0x1");
+    set_base(zoru_miner::protocol::MAX_TRANSACTION_FEE);
+    let before = c.nonce(signer.address(), "latest").unwrap();
+    let error = c
+        .send(&signer, "excessive-fee", c.manifest.ledger, data, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("bounded gas balance"));
+    assert_eq!(c.nonce(signer.address(), "latest").unwrap(), before);
+    assert!(
+        fs::read_dir(&c.journal)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|v| v.path().extension().is_some_and(|e| e == "json"))
+            .all(
+                |v| serde_json::from_slice::<Journal>(&fs::read(v.path()).unwrap())
+                    .unwrap()
+                    .state
+                    == "confirmed"
+            )
+    );
+    set_base(1_000_000_000);
+}
 
 fn prepared(
     c: &Client,
@@ -40,7 +123,6 @@ fn prepared(
         raw: format!("0x{}", hex::encode(raw)),
         state: "prepared".into(),
         label: "recovery-regression".into(),
-        beacon_epoch: None,
         receipt: None,
         replacement: None,
     }

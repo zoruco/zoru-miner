@@ -25,7 +25,7 @@ use std::{
 };
 
 pub const CHAIN: u64 = 6736;
-pub const GAS_PRICE: u128 = 150_000_000_000;
+pub const MAX_TRANSACTION_FEE: u128 = 3_300_000_000_000_000_000;
 pub const NATIVE_ID: &str = "f9f432b1851b5c179d2091a96f593aaed50ec7466b74f89301f957a83e56ce1f";
 pub const DRAND_HASH: &str = "04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3";
 pub const REORG_WINDOW: u64 = 128;
@@ -154,9 +154,6 @@ pub struct Journal {
     pub raw: String,
     pub state: String,
     pub label: String,
-    /// Epoch of a signed drand publication, retained for safe recovery.
-    #[serde(default)]
-    pub beacon_epoch: Option<u64>,
     pub receipt: Option<Value>,
     pub replacement: Option<B256>,
 }
@@ -173,8 +170,8 @@ fn beacon_epoch_from_calldata(input: &[u8]) -> Result<u64> {
     Ok(U256::from_be_slice(&input[4..36]).try_into()?)
 }
 
-/// Old journals have no beacon_epoch field. Recover it from the signed intent,
-/// checking the signature and every identity field before trusting that epoch.
+/// The signed calldata is the sole source of the publication epoch.
+/// Check the signature and every identity field before trusting it.
 fn signed_beacon_epoch(entry: &Journal, beacon: Address) -> Result<u64> {
     let raw = abi::bytes(&entry.raw)?;
     let tx = TxEnvelope::decode_2718_exact(&raw)?;
@@ -188,32 +185,28 @@ fn signed_beacon_epoch(entry: &Journal, beacon: Address) -> Result<u64> {
             && tx.recover_signer()? == entry.account,
         "Signed beacon journal identity mismatch"
     );
-    let epoch = beacon_epoch_from_calldata(tx.input())?;
-    ensure!(
-        entry.beacon_epoch.is_none_or(|saved| saved == epoch),
-        "Signed beacon journal epoch mismatch"
-    );
-    Ok(epoch)
+    beacon_epoch_from_calldata(tx.input())
 }
 
 /// Never discard a signed journal solely because the RPC rejected it.
 /// A competing miner may have published the same beacon: archive the obsolete
 /// transaction only after confirming the original hash is absent, the nonce
-/// is unchanged on both chain views, and the exact epoch is cached on-chain.
+/// is unchanged on both chain views, and the exact epoch is either cached
+/// on-chain or already closed for mining. Keep the original signed bytes.
 fn obsolete_beacon_journal(
     entry: &Journal,
     latest_nonce: u64,
     pending_nonce: u64,
     transaction_known: bool,
     seed_verified: bool,
+    epoch_closed: bool,
 ) -> bool {
     entry.label == "publish-drand"
         && entry.state == "prepared"
-        && entry.beacon_epoch.is_some()
         && entry.nonce == latest_nonce
         && entry.nonce == pending_nonce
         && !transaction_known
-        && seed_verified
+        && (seed_verified || epoch_closed)
 }
 
 pub struct Client {
@@ -519,6 +512,14 @@ impl Client {
                 .context("Invalid native balance")?,
         )
     }
+    pub fn gas_price(&self) -> Result<u128> {
+        let quote = self.read.request("eth_gasPrice", json!([]))?;
+        let price: u128 = abi::quantity(quote.as_str().context("Invalid gas price")?)?
+            .try_into()
+            .context("Gas price exceeds supported range")?;
+        ensure!(price > 0, "RPC returned a zero gas price");
+        Ok(price)
+    }
     pub fn nonce(&self, account: Address, tag: &str) -> Result<u64> {
         Ok(abi::quantity(
             self.read
@@ -680,10 +681,6 @@ impl Client {
             }
             if entry.label == "publish-drand" && entry.state == "prepared" {
                 let epoch = signed_beacon_epoch(&entry, self.manifest.beacon)?;
-                if entry.beacon_epoch.is_none() {
-                    entry.beacon_epoch = Some(epoch);
-                    self.write_journal(&entry)?;
-                }
                 let latest = self.nonce(account, "latest")?;
                 let pending = self.nonce(account, "pending")?;
                 if latest == entry.nonce && pending == entry.nonce {
@@ -697,7 +694,17 @@ impl Client {
                             "verifiedSeed(uint48)",
                             &[abi::uint(U256::from(epoch))],
                         )?)? != U256::ZERO;
-                        if obsolete_beacon_journal(&entry, latest, pending, known, seed_verified) {
+                        let epoch_closed = self.now()?
+                            >= self.manifest.launch_time
+                                + (epoch + 1) * self.manifest.epoch_seconds;
+                        if obsolete_beacon_journal(
+                            &entry,
+                            latest,
+                            pending,
+                            known,
+                            seed_verified,
+                            epoch_closed,
+                        ) {
                             entry.state = "superseded-beacon".into();
                             self.write_journal(&entry)?;
                             self.archive_journal(&entry)?;
@@ -763,8 +770,12 @@ impl Client {
         let estimated: u64 =
             abi::quantity(estimate.as_str().context("Invalid gas estimate")?)?.try_into()?;
         let gas = estimated.saturating_mul(13) / 10 + 30_000;
+        let gas_price = self.gas_price()?;
+        let maximum_fee = U256::from(gas) * U256::from(gas_price);
         ensure!(
-            gas <= 22_000_000 && self.balance(account)? >= U256::from(gas) * U256::from(GAS_PRICE),
+            gas <= 22_000_000
+                && maximum_fee <= U256::from(MAX_TRANSACTION_FEE)
+                && self.balance(account)? >= maximum_fee,
             "Insufficient bounded gas balance"
         );
         if let Some(work) = expected {
@@ -776,7 +787,7 @@ impl Client {
         let tx = TxLegacy {
             chain_id: Some(CHAIN),
             nonce,
-            gas_price: GAS_PRICE,
+            gas_price,
             gas_limit: gas,
             to: TxKind::Call(to),
             value: U256::ZERO,
@@ -786,15 +797,13 @@ impl Client {
         let envelope = TxEnvelope::from(tx.into_signed(signature));
         let raw = envelope.encoded_2718();
         let hash = abi::keccak(&raw);
-        let beacon_epoch = if label == "publish-drand" {
+        if label == "publish-drand" {
             ensure!(
                 to == self.manifest.beacon,
                 "Unexpected drand publication recipient"
             );
-            Some(beacon_epoch_from_calldata(&abi::bytes(&data)?)?)
-        } else {
-            None
-        };
+            beacon_epoch_from_calldata(&abi::bytes(&data)?)?;
+        }
         let mut record = Journal {
             chain_id: CHAIN,
             account,
@@ -803,7 +812,6 @@ impl Client {
             raw: format!("0x{}", hex::encode(raw)),
             state: "prepared".into(),
             label: label.into(),
-            beacon_epoch,
             receipt: None,
             replacement: None,
         };
@@ -853,6 +861,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const GAS_PRICE: u128 = 150_000_000_000;
 
     fn signed_publication(input: Vec<u8>) -> (Journal, Address) {
         let signer = PrivateKeySigner::random();
@@ -877,7 +886,6 @@ mod tests {
                 raw: format!("0x{}", hex::encode(raw)),
                 state: "prepared".into(),
                 label: "publish-drand".into(),
-                beacon_epoch: None,
                 receipt: None,
                 replacement: None,
             },
@@ -900,13 +908,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_beacon_epoch_comes_from_the_authenticated_signed_transaction() {
+    fn beacon_epoch_comes_from_the_authenticated_signed_transaction() {
         for epoch in [0, 21, (1u64 << 48) - 1] {
             let (entry, beacon) = signed_publication(publication_input(epoch));
-            let mut legacy = serde_json::to_value(&entry).unwrap();
-            legacy.as_object_mut().unwrap().remove("beacon_epoch");
-            let recovered: Journal = serde_json::from_value(legacy).unwrap();
-            assert_eq!(recovered.beacon_epoch, None);
+            let stored = serde_json::to_value(&entry).unwrap();
+            assert!(stored.get("beacon_epoch").is_none());
+            let recovered: Journal = serde_json::from_value(stored).unwrap();
             assert_eq!(signed_beacon_epoch(&recovered, beacon).unwrap(), epoch);
         }
     }
@@ -914,21 +921,13 @@ mod tests {
     #[test]
     fn beacon_recovery_rejects_mismatched_metadata_and_noncanonical_input() {
         let (entry, beacon) = signed_publication(publication_input(21));
-        for field in [
-            "account",
-            "nonce",
-            "hash",
-            "chain_id",
-            "beacon_epoch",
-            "raw",
-        ] {
+        for field in ["account", "nonce", "hash", "chain_id", "raw"] {
             let mut bad = entry.clone();
             match field {
                 "account" => bad.account = Address::ZERO,
                 "nonce" => bad.nonce += 1,
                 "hash" => bad.hash = B256::ZERO,
                 "chain_id" => bad.chain_id += 1,
-                "beacon_epoch" => bad.beacon_epoch = Some(22),
                 "raw" => bad.raw.push_str("00"),
                 _ => unreachable!(),
             }
@@ -946,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_beacon_journal_requires_proven_external_publication() {
+    fn obsolete_beacon_journal_requires_verified_obsolescence_and_unused_nonce() {
         let mut entry = Journal {
             chain_id: CHAIN,
             account: Address::repeat_byte(0x85),
@@ -955,29 +954,21 @@ mod tests {
             raw: "0x00".into(),
             state: "prepared".into(),
             label: "publish-drand".into(),
-            beacon_epoch: Some(0),
             receipt: None,
             replacement: None,
         };
-        assert!(obsolete_beacon_journal(&entry, 5, 5, false, true));
-        assert!(!obsolete_beacon_journal(&entry, 4, 5, false, true));
-        assert!(!obsolete_beacon_journal(&entry, 5, 6, false, true));
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, true));
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, false));
-        entry.beacon_epoch = None;
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
-        entry.beacon_epoch = Some(0);
+        assert!(obsolete_beacon_journal(&entry, 5, 5, false, true, false));
+        assert!(obsolete_beacon_journal(&entry, 5, 5, false, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 4, 5, false, true, false));
+        assert!(!obsolete_beacon_journal(&entry, 5, 6, false, true, false));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, true, false));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, false, false));
         entry.state = "confirmed".into();
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true, false));
         entry.state = "prepared".into();
         entry.label = "mined-proof".into();
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true));
-
-        // Journals written before this patch must deserialize unchanged.
-        let mut old = serde_json::to_value(&entry).unwrap();
-        old.as_object_mut().unwrap().remove("beacon_epoch");
-        let restored: Journal = serde_json::from_value(old).unwrap();
-        assert_eq!(restored.beacon_epoch, None);
+        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true, false));
     }
 
     #[test]

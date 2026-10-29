@@ -1,4 +1,4 @@
-//! Recover pre-upgrade signed beacon journals without broadcasting or losing intent.
+//! Recover obsolete signed publications without broadcasting or losing intent.
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, U256};
@@ -18,12 +18,12 @@ use std::{
 };
 use zoru_miner::{
     abi,
-    protocol::{CHAIN, Client, GAS_PRICE, Journal, Manifest},
+    protocol::{CHAIN, Client, Journal, Manifest},
     storage,
 };
 
 #[test]
-fn old_beacon_journals_recover_and_reused_nonce_archives_preserve_both_hashes() {
+fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -64,9 +64,22 @@ fn old_beacon_journals_recover_and_reused_nonce_archives_preserve_both_hashes() 
                 "eth_chainId" => json!(format!("0x{CHAIN:x}")),
                 "web3_clientVersion" => json!("anvil"),
                 "eth_blockNumber" => json!("0x100"),
+                "eth_getBlockByNumber" => json!({"timestamp":"0x10000"}),
                 "eth_getTransactionReceipt" | "eth_getTransactionByHash" => Value::Null,
                 "eth_getTransactionCount" => json!("0x5"),
-                "eth_call" => json!(format!("0x{}", "42".repeat(32))),
+                // Epoch 22 was never published, but its mining window is closed.
+                "eth_call" => {
+                    let epoch_22 = abi::call("verifiedSeed(uint48)", &[abi::uint(U256::from(22))]);
+                    json!(format!(
+                        "0x{}",
+                        if request["params"][0]["data"] == epoch_22 {
+                            "00"
+                        } else {
+                            "42"
+                        }
+                        .repeat(32)
+                    ))
+                }
                 other => panic!("Unexpected RPC, recovery must not broadcast: {other}"),
             };
             let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
@@ -113,7 +126,7 @@ fn old_beacon_journals_recover_and_reused_nonce_archives_preserve_both_hashes() 
         let tx = TxLegacy {
             chain_id: Some(CHAIN),
             nonce: 5,
-            gas_price: GAS_PRICE,
+            gas_price: 150_000_000_000,
             gas_limit: 900_000,
             to: beacon.into(),
             value: U256::ZERO,
@@ -123,14 +136,14 @@ fn old_beacon_journals_recover_and_reused_nonce_archives_preserve_both_hashes() 
         let raw = TxEnvelope::from(tx.into_signed(signature)).encoded_2718();
         let hash = abi::keccak(&raw);
         hashes.push(hash);
-        let mut legacy = json!({"chain_id":CHAIN,"account":signer.address(),"nonce":5,
+        let record = json!({"chain_id":CHAIN,"account":signer.address(),"nonce":5,
             "hash":hash,"raw":format!("0x{}",hex::encode(raw)),"state":"prepared",
             "label":"publish-drand","receipt":null,"replacement":null});
-        assert!(legacy.get("beacon_epoch").is_none());
+        assert!(record.get("beacon_epoch").is_none());
         let path = client
             .journal
             .join(format!("{:#x}-{:020}.json", signer.address(), 5));
-        storage::atomic_json(&path, &legacy).unwrap();
+        storage::atomic_json(&path, &record).unwrap();
         client.reconcile(signer.address(), true).unwrap();
         assert!(!path.exists());
         let archived = client.journal.join("resolved").join(format!(
@@ -140,10 +153,8 @@ fn old_beacon_journals_recover_and_reused_nonce_archives_preserve_both_hashes() 
         ));
         let saved: Journal = serde_json::from_slice(&fs::read(archived).unwrap()).unwrap();
         assert_eq!(saved.state, "superseded-beacon");
-        assert_eq!(saved.beacon_epoch, Some(epoch));
         assert_eq!(saved.hash, hash);
-        assert_eq!(saved.raw, legacy["raw"].as_str().unwrap());
-        legacy["beacon_epoch"] = json!(epoch);
+        assert_eq!(saved.raw, record["raw"].as_str().unwrap());
     }
     assert_ne!(hashes[0], hashes[1]);
     assert_eq!(
