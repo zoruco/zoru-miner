@@ -38,12 +38,12 @@ The binaries are `build/zoru-miner-cli` and `build/zoru-miner-gui`. Use only an 
 
 ## Mining and rewards
 
-Set the RPC endpoints before running the CLI:
+Set the RPC endpoints before running the CLI. For other VEX EVM endpoints, see [Chainlist](https://chainlist.org/chain/6736) and check the chain ID before connecting:
 
 ```sh
-export EVM_RPC=https://api.windcrypto.com/rpc
-export EVM_SUBMIT_RPC=https://api.windcrypto.com/rpc
-export VEX_NATIVE_RPC=https://api.windcrypto.com
+export EVM_RPC=https://vexascan.com/rpc
+export EVM_SUBMIT_RPC=https://vexascan.com/rpc
+export VEX_NATIVE_RPC=https://vexascan.com:8443
 ```
 
 ```sh

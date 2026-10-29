@@ -21,9 +21,9 @@ int main(int argc, char **argv) {
     const QString manifest = QDir::cleanPath(QCoreApplication::applicationDirPath() + "/../deployment.json");
     QJsonObject defaults = {
         {"manifest", QFile::exists(manifest) ? manifest : QString()},
-        {"read", "https://api.windcrypto.com/rpc"},
-        {"submit", "https://api.windcrypto.com/rpc"},
-        {"native", "https://api.windcrypto.com"}
+        {"read", "https://vexascan.com/rpc"},
+        {"submit", "https://vexascan.com/rpc"},
+        {"native", "https://vexascan.com:8443"}
     };
     window.configure(defaults);
     if (parser.isSet("config")) {
