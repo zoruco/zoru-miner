@@ -4,8 +4,10 @@ use crate::{
     rpc::Rpc,
     storage,
 };
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
+use alloy_consensus::{
+    SignableTransaction, Transaction, TxEnvelope, TxLegacy, transaction::SignerRecoverable,
+};
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -157,6 +159,41 @@ pub struct Journal {
     pub beacon_epoch: Option<u64>,
     pub receipt: Option<Value>,
     pub replacement: Option<B256>,
+}
+
+fn beacon_epoch_from_calldata(input: &[u8]) -> Result<u64> {
+    ensure!(
+        input.len() == 164
+            && input[..4] == abi::keccak(b"publish(uint48,bytes)")[..4]
+            && input[4..30].iter().all(|byte| *byte == 0)
+            && U256::from_be_slice(&input[36..68]) == U256::from(64)
+            && U256::from_be_slice(&input[68..100]) == U256::from(64),
+        "Unexpected drand publication calldata"
+    );
+    Ok(U256::from_be_slice(&input[4..36]).try_into()?)
+}
+
+/// Old journals have no beacon_epoch field. Recover it from the signed intent,
+/// checking the signature and every identity field before trusting that epoch.
+fn signed_beacon_epoch(entry: &Journal, beacon: Address) -> Result<u64> {
+    let raw = abi::bytes(&entry.raw)?;
+    let tx = TxEnvelope::decode_2718_exact(&raw)?;
+    ensure!(
+        entry.chain_id == CHAIN
+            && tx.chain_id() == Some(CHAIN)
+            && tx.nonce() == entry.nonce
+            && tx.to() == Some(beacon)
+            && tx.value() == U256::ZERO
+            && abi::keccak(&raw) == entry.hash
+            && tx.recover_signer()? == entry.account,
+        "Signed beacon journal identity mismatch"
+    );
+    let epoch = beacon_epoch_from_calldata(tx.input())?;
+    ensure!(
+        entry.beacon_epoch.is_none_or(|saved| saved == epoch),
+        "Signed beacon journal epoch mismatch"
+    );
+    Ok(epoch)
 }
 
 /// Never discard a signed journal solely because the RPC rejected it.
@@ -502,7 +539,10 @@ impl Client {
         fs::create_dir_all(&archive)?;
         fs::rename(
             self.journal_path(record.account, record.nonce),
-            archive.join(format!("{:#x}-{:020}.json", record.account, record.nonce)),
+            archive.join(format!(
+                "{:#x}-{:020}-{:#x}.json",
+                record.account, record.nonce, record.hash
+            )),
         )?;
         #[cfg(unix)]
         {
@@ -638,10 +678,12 @@ impl Client {
                 self.write_journal(&entry)?;
                 continue;
             }
-            if let Some(epoch) = entry.beacon_epoch
-                && entry.label == "publish-drand"
-                && entry.state == "prepared"
-            {
+            if entry.label == "publish-drand" && entry.state == "prepared" {
+                let epoch = signed_beacon_epoch(&entry, self.manifest.beacon)?;
+                if entry.beacon_epoch.is_none() {
+                    entry.beacon_epoch = Some(epoch);
+                    self.write_journal(&entry)?;
+                }
                 let latest = self.nonce(account, "latest")?;
                 let pending = self.nonce(account, "pending")?;
                 if latest == entry.nonce && pending == entry.nonce {
@@ -745,15 +787,11 @@ impl Client {
         let raw = envelope.encoded_2718();
         let hash = abi::keccak(&raw);
         let beacon_epoch = if label == "publish-drand" {
-            let input = abi::bytes(&data)?;
             ensure!(
-                to == self.manifest.beacon
-                    && input.len() == 164
-                    && input.starts_with(&[0xa9, 0xe9, 0x12, 0x97])
-                    && input[4..28].iter().all(|byte| *byte == 0),
-                "Unexpected drand publication calldata"
+                to == self.manifest.beacon,
+                "Unexpected drand publication recipient"
             );
-            Some(u64::from_be_bytes(input[28..36].try_into()?))
+            Some(beacon_epoch_from_calldata(&abi::bytes(&data)?)?)
         } else {
             None
         };
@@ -815,6 +853,98 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_publication(input: Vec<u8>) -> (Journal, Address) {
+        let signer = PrivateKeySigner::random();
+        let beacon = Address::repeat_byte(0x56);
+        let tx = TxLegacy {
+            chain_id: Some(CHAIN),
+            nonce: 5,
+            gas_price: GAS_PRICE,
+            gas_limit: 900_000,
+            to: beacon.into(),
+            value: U256::ZERO,
+            input: input.into(),
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let raw = TxEnvelope::from(tx.into_signed(signature)).encoded_2718();
+        (
+            Journal {
+                chain_id: CHAIN,
+                account: signer.address(),
+                nonce: 5,
+                hash: abi::keccak(&raw),
+                raw: format!("0x{}", hex::encode(raw)),
+                state: "prepared".into(),
+                label: "publish-drand".into(),
+                beacon_epoch: None,
+                receipt: None,
+                replacement: None,
+            },
+            beacon,
+        )
+    }
+
+    fn publication_input(epoch: u64) -> Vec<u8> {
+        let mut data = abi::bytes(&abi::call(
+            "publish(uint48,bytes)",
+            &[
+                abi::uint(U256::from(epoch)),
+                abi::uint(U256::from(64)),
+                abi::uint(U256::from(64)),
+            ],
+        ))
+        .unwrap();
+        data.extend_from_slice(&[0x12; 64]);
+        data
+    }
+
+    #[test]
+    fn legacy_beacon_epoch_comes_from_the_authenticated_signed_transaction() {
+        for epoch in [0, 21, (1u64 << 48) - 1] {
+            let (entry, beacon) = signed_publication(publication_input(epoch));
+            let mut legacy = serde_json::to_value(&entry).unwrap();
+            legacy.as_object_mut().unwrap().remove("beacon_epoch");
+            let recovered: Journal = serde_json::from_value(legacy).unwrap();
+            assert_eq!(recovered.beacon_epoch, None);
+            assert_eq!(signed_beacon_epoch(&recovered, beacon).unwrap(), epoch);
+        }
+    }
+
+    #[test]
+    fn beacon_recovery_rejects_mismatched_metadata_and_noncanonical_input() {
+        let (entry, beacon) = signed_publication(publication_input(21));
+        for field in [
+            "account",
+            "nonce",
+            "hash",
+            "chain_id",
+            "beacon_epoch",
+            "raw",
+        ] {
+            let mut bad = entry.clone();
+            match field {
+                "account" => bad.account = Address::ZERO,
+                "nonce" => bad.nonce += 1,
+                "hash" => bad.hash = B256::ZERO,
+                "chain_id" => bad.chain_id += 1,
+                "beacon_epoch" => bad.beacon_epoch = Some(22),
+                "raw" => bad.raw.push_str("00"),
+                _ => unreachable!(),
+            }
+            assert!(signed_beacon_epoch(&bad, beacon).is_err(), "{field}");
+        }
+        assert!(signed_beacon_epoch(&entry, Address::ZERO).is_err());
+        for index in [0, 4, 29, 36, 67, 68, 99] {
+            let mut input = publication_input(21);
+            input[index] ^= 1;
+            let (bad, beacon) = signed_publication(input);
+            assert!(signed_beacon_epoch(&bad, beacon).is_err(), "byte {index}");
+        }
+        let (bad, beacon) = signed_publication(publication_input(1u64 << 48));
+        assert!(signed_beacon_epoch(&bad, beacon).is_err());
+    }
+
     #[test]
     fn obsolete_beacon_journal_requires_proven_external_publication() {
         let mut entry = Journal {

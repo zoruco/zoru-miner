@@ -156,7 +156,7 @@ mod tests {
                 serde_json::from_slice::<Value>(&body).unwrap()["method"],
                 "eth_chainId"
             );
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":"0xb690"}"#;
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":"0x1a50"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -165,7 +165,7 @@ mod tests {
             .unwrap();
         });
         let rpc = Rpc::new(&format!("http://{address}"), Duration::ZERO).unwrap();
-        assert_eq!(rpc.request("eth_chainId", json!([])).unwrap(), "0xb690");
+        assert_eq!(rpc.request("eth_chainId", json!([])).unwrap(), "0x1a50");
         server.join().unwrap();
     }
 

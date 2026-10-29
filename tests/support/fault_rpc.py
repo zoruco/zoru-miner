@@ -31,7 +31,7 @@ def main():
     def rpc(method):
         return upstream({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': []})['result']
 
-    if rpc('eth_chainId') != '0xb690' or 'anvil' not in rpc('web3_clientVersion').lower():
+    if int(rpc('eth_chainId'), 16) != 6736 or 'anvil' not in rpc('web3_clientVersion').lower():
         raise ValueError('Only isolated Anvil chain 6736 is permitted')
     control = Path(args.control)
     events = Path(args.events)
