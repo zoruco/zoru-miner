@@ -39,6 +39,15 @@ fn is_epoch_boundary_revert(error: &anyhow::Error) -> bool {
 
 pub const IMPL_SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
+fn verify_evm_chain(rpc: &Rpc) -> Result<()> {
+    let chain = rpc.request("eth_chainId", json!([]))?;
+    ensure!(
+        abi::quantity(chain.as_str().context("Invalid chain id")?)? == U256::from(CHAIN),
+        "Wrong EVM chain: expected 6736"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -170,22 +179,36 @@ fn beacon_epoch_from_calldata(input: &[u8]) -> Result<u64> {
     Ok(U256::from_be_slice(&input[4..36]).try_into()?)
 }
 
-/// The signed calldata is the sole source of the publication epoch.
+/// The signed calldata is the sole source of the mining epoch.
 /// Check the signature and every identity field before trusting it.
-fn signed_beacon_epoch(entry: &Journal, beacon: Address) -> Result<u64> {
+fn signed_mining_epoch(entry: &Journal, recipient: Address) -> Result<u64> {
     let raw = abi::bytes(&entry.raw)?;
     let tx = TxEnvelope::decode_2718_exact(&raw)?;
     ensure!(
         entry.chain_id == CHAIN
             && tx.chain_id() == Some(CHAIN)
             && tx.nonce() == entry.nonce
-            && tx.to() == Some(beacon)
+            && tx.to() == Some(recipient)
             && tx.value() == U256::ZERO
             && abi::keccak(&raw) == entry.hash
             && tx.recover_signer()? == entry.account,
-        "Signed beacon journal identity mismatch"
+        "Signed mining journal identity mismatch"
     );
-    beacon_epoch_from_calldata(tx.input())
+    match entry.label.as_str() {
+        "publish-drand" => beacon_epoch_from_calldata(tx.input()),
+        "mined-proof" => {
+            let input = tx.input();
+            ensure!(
+                input.len() == 100
+                    && input[..4] == abi::keccak(b"submit(uint48,address,uint256)")[..4]
+                    && input[4..30].iter().all(|byte| *byte == 0)
+                    && input[36..68] == abi::address(entry.account)[..],
+                "Unexpected proof submission calldata"
+            );
+            Ok(U256::from_be_slice(&input[4..36]).try_into()?)
+        }
+        _ => bail!("Unsupported mining journal intent"),
+    }
 }
 
 /// Never discard a signed journal solely because the RPC rejected it.
@@ -193,7 +216,7 @@ fn signed_beacon_epoch(entry: &Journal, beacon: Address) -> Result<u64> {
 /// transaction only after confirming the original hash is absent, the nonce
 /// is unchanged on both chain views, and the exact epoch is either cached
 /// on-chain or already closed for mining. Keep the original signed bytes.
-fn obsolete_beacon_journal(
+fn obsolete_mining_journal(
     entry: &Journal,
     latest_nonce: u64,
     pending_nonce: u64,
@@ -201,12 +224,32 @@ fn obsolete_beacon_journal(
     seed_verified: bool,
     epoch_closed: bool,
 ) -> bool {
-    entry.label == "publish-drand"
+    matches!(entry.label.as_str(), "publish-drand" | "mined-proof")
         && entry.state == "prepared"
         && entry.nonce == latest_nonce
         && entry.nonce == pending_nonce
         && !transaction_known
-        && (seed_verified || epoch_closed)
+        && ((entry.label == "publish-drand" && seed_verified) || epoch_closed)
+}
+
+fn receipt_location(receipt: &Value, expected_hash: B256) -> Result<(u64, B256)> {
+    let hash: B256 = receipt["transactionHash"]
+        .as_str()
+        .context("Receipt transaction hash missing")?
+        .parse()?;
+    ensure!(hash == expected_hash, "Receipt transaction hash mismatch");
+    let height = abi::quantity(
+        receipt["blockNumber"]
+            .as_str()
+            .context("Receipt block number missing")?,
+    )?
+    .try_into()?;
+    let block_hash: B256 = receipt["blockHash"]
+        .as_str()
+        .context("Receipt block hash missing")?
+        .parse()?;
+    ensure!(block_hash != B256::ZERO, "Receipt block hash is zero");
+    Ok((height, block_hash))
 }
 
 pub struct Client {
@@ -249,11 +292,7 @@ impl Client {
         Ok(result)
     }
     pub fn identity(&self) -> Result<()> {
-        let chain = self.read.request("eth_chainId", json!([]))?;
-        ensure!(
-            abi::quantity(chain.as_str().context("Invalid chain id")?)? == U256::from(CHAIN),
-            "Wrong EVM chain: expected 6736"
-        );
+        verify_evm_chain(&self.read)?;
         if self.manifest.mode == "local" {
             let version = self.read.request("web3_clientVersion", json!([]))?;
             ensure!(
@@ -513,7 +552,8 @@ impl Client {
         )
     }
     pub fn gas_price(&self) -> Result<u128> {
-        let quote = self.read.request("eth_gasPrice", json!([]))?;
+        verify_evm_chain(&self.submit)?;
+        let quote = self.submit.request("eth_gasPrice", json!([]))?;
         let price: u128 = abi::quantity(quote.as_str().context("Invalid gas price")?)?
             .try_into()
             .context("Gas price exceeds supported range")?;
@@ -552,21 +592,41 @@ impl Client {
         }
         Ok(())
     }
+    fn canonical_receipt(&self, hash: B256, receipt: &Value) -> Result<bool> {
+        if receipt.is_null() {
+            return Ok(false);
+        }
+        let (height, expected_block) = receipt_location(receipt, hash)?;
+        let block = self.read.request(
+            "eth_getBlockByNumber",
+            json!([format!("0x{height:x}"), false]),
+        )?;
+        if block.is_null() {
+            return Ok(false);
+        }
+        ensure!(
+            abi::quantity(
+                block["number"]
+                    .as_str()
+                    .context("Canonical block height missing")?
+            )? == U256::from(height),
+            "Canonical block height mismatch"
+        );
+        Ok(block["hash"]
+            .as_str()
+            .context("Canonical block hash missing")?
+            .parse::<B256>()?
+            == expected_block)
+    }
     pub fn receipt(&self, hash: B256, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Ok(receipt) = self
                 .read
                 .request("eth_getTransactionReceipt", json!([hash]))
-                && !receipt.is_null()
+                && self.canonical_receipt(hash, &receipt)?
             {
-                let block = self.read.request(
-                    "eth_getBlockByNumber",
-                    json!([receipt["blockNumber"], false]),
-                )?;
-                if block["hash"] == receipt["blockHash"] {
-                    return Ok(receipt);
-                }
+                return Ok(receipt);
             }
             self.health()?;
             thread::sleep(Duration::from_millis(400));
@@ -574,6 +634,7 @@ impl Client {
         bail!("Receipt pending; retain the signed transaction journal")
     }
     pub fn reconcile(&self, account: Address, confirmed: bool) -> Result<()> {
+        let latest_nonce = self.nonce(account, "latest")?;
         let head: u64 = abi::quantity(
             self.read
                 .request("eth_blockNumber", json!([]))?
@@ -594,7 +655,7 @@ impl Client {
                 entry.chain_id == CHAIN && entry.account == account,
                 "Journal network or account mismatch"
             );
-            if matches!(entry.state.as_str(), "replaced" | "superseded-beacon") {
+            if matches!(entry.state.as_str(), "replaced" | "superseded") {
                 self.archive_journal(&entry)?;
                 continue;
             }
@@ -607,22 +668,13 @@ impl Client {
                 .map(u64::try_from)
                 .transpose()?
                 .is_some_and(|n| head >= n.saturating_add(REORG_WINDOW));
-            if entry.state == "confirmed" && !confirmed && !old {
+            if entry.state == "confirmed" && !confirmed && !old && entry.nonce < latest_nonce {
                 continue;
             }
             let receipt = self
                 .read
                 .request("eth_getTransactionReceipt", json!([entry.hash]))?;
-            let canonical = if receipt.is_null() {
-                false
-            } else {
-                self.read.request(
-                    "eth_getBlockByNumber",
-                    json!([receipt["blockNumber"], false]),
-                )?["hash"]
-                    == receipt["blockHash"]
-            };
-            if canonical {
+            if self.canonical_receipt(entry.hash, &receipt)? {
                 let block: u64 = abi::quantity(
                     receipt["blockNumber"]
                         .as_str()
@@ -636,6 +688,11 @@ impl Client {
                     self.archive_journal(&entry)?;
                 }
                 continue;
+            }
+            if entry.state == "confirmed" {
+                entry.state = "prepared".into();
+                entry.receipt = None;
+                self.write_journal(&entry)?;
             }
             if self.nonce(account, "latest")? > entry.nonce {
                 let head: u64 = abi::quantity(
@@ -679,8 +736,16 @@ impl Client {
                 self.write_journal(&entry)?;
                 continue;
             }
-            if entry.label == "publish-drand" && entry.state == "prepared" {
-                let epoch = signed_beacon_epoch(&entry, self.manifest.beacon)?;
+            if matches!(entry.label.as_str(), "publish-drand" | "mined-proof")
+                && entry.state == "prepared"
+            {
+                let is_beacon = entry.label == "publish-drand";
+                let recipient = if is_beacon {
+                    self.manifest.beacon
+                } else {
+                    self.manifest.ledger
+                };
+                let epoch = signed_mining_epoch(&entry, recipient)?;
                 let latest = self.nonce(account, "latest")?;
                 let pending = self.nonce(account, "pending")?;
                 if latest == entry.nonce && pending == entry.nonce {
@@ -689,15 +754,16 @@ impl Client {
                         .request("eth_getTransactionByHash", json!([entry.hash]))?
                         .is_null();
                     if !known {
-                        let seed_verified = abi::scalar(&self.call(
-                            self.manifest.beacon,
-                            "verifiedSeed(uint48)",
-                            &[abi::uint(U256::from(epoch))],
-                        )?)? != U256::ZERO;
+                        let seed_verified = is_beacon
+                            && abi::scalar(&self.call(
+                                self.manifest.beacon,
+                                "verifiedSeed(uint48)",
+                                &[abi::uint(U256::from(epoch))],
+                            )?)? != U256::ZERO;
                         let epoch_closed = self.now()?
                             >= self.manifest.launch_time
                                 + (epoch + 1) * self.manifest.epoch_seconds;
-                        if obsolete_beacon_journal(
+                        if obsolete_mining_journal(
                             &entry,
                             latest,
                             pending,
@@ -705,7 +771,7 @@ impl Client {
                             seed_verified,
                             epoch_closed,
                         ) {
-                            entry.state = "superseded-beacon".into();
+                            entry.state = "superseded".into();
                             self.write_journal(&entry)?;
                             self.archive_journal(&entry)?;
                             continue;
@@ -762,6 +828,10 @@ impl Client {
         ensure!(
             nonce == self.nonce(account, "latest")?,
             "Another transaction is pending for this account"
+        );
+        ensure!(
+            !self.journal_path(account, nonce).exists(),
+            "Signing nonce is already journaled; reconcile before signing again"
         );
         let estimate = self.read.request(
             "eth_estimateGas",
@@ -863,6 +933,23 @@ mod tests {
     use super::*;
     const GAS_PRICE: u128 = 150_000_000_000;
 
+    #[test]
+    fn receipt_identity_must_bind_the_transaction_and_canonical_location() {
+        let hash = B256::repeat_byte(0x12);
+        let block = B256::repeat_byte(0x34);
+        let receipt = json!({"transactionHash":hash,"blockNumber":"0x42","blockHash":block});
+        assert_eq!(receipt_location(&receipt, hash).unwrap(), (66, block));
+        assert!(receipt_location(&receipt, B256::repeat_byte(0x56)).is_err());
+        for field in ["transactionHash", "blockNumber", "blockHash"] {
+            let mut invalid = receipt.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(receipt_location(&invalid, hash).is_err(), "{field}");
+        }
+        let mut invalid = receipt;
+        invalid["blockHash"] = json!(B256::ZERO);
+        assert!(receipt_location(&invalid, hash).is_err());
+    }
+
     fn signed_publication(input: Vec<u8>) -> (Journal, Address) {
         let signer = PrivateKeySigner::random();
         let beacon = Address::repeat_byte(0x56);
@@ -914,7 +1001,7 @@ mod tests {
             let stored = serde_json::to_value(&entry).unwrap();
             assert!(stored.get("beacon_epoch").is_none());
             let recovered: Journal = serde_json::from_value(stored).unwrap();
-            assert_eq!(signed_beacon_epoch(&recovered, beacon).unwrap(), epoch);
+            assert_eq!(signed_mining_epoch(&recovered, beacon).unwrap(), epoch);
         }
     }
 
@@ -931,21 +1018,21 @@ mod tests {
                 "raw" => bad.raw.push_str("00"),
                 _ => unreachable!(),
             }
-            assert!(signed_beacon_epoch(&bad, beacon).is_err(), "{field}");
+            assert!(signed_mining_epoch(&bad, beacon).is_err(), "{field}");
         }
-        assert!(signed_beacon_epoch(&entry, Address::ZERO).is_err());
+        assert!(signed_mining_epoch(&entry, Address::ZERO).is_err());
         for index in [0, 4, 29, 36, 67, 68, 99] {
             let mut input = publication_input(21);
             input[index] ^= 1;
             let (bad, beacon) = signed_publication(input);
-            assert!(signed_beacon_epoch(&bad, beacon).is_err(), "byte {index}");
+            assert!(signed_mining_epoch(&bad, beacon).is_err(), "byte {index}");
         }
         let (bad, beacon) = signed_publication(publication_input(1u64 << 48));
-        assert!(signed_beacon_epoch(&bad, beacon).is_err());
+        assert!(signed_mining_epoch(&bad, beacon).is_err());
     }
 
     #[test]
-    fn obsolete_beacon_journal_requires_verified_obsolescence_and_unused_nonce() {
+    fn obsolete_mining_journal_requires_verified_obsolescence_and_unused_nonce() {
         let mut entry = Journal {
             chain_id: CHAIN,
             account: Address::repeat_byte(0x85),
@@ -957,18 +1044,18 @@ mod tests {
             receipt: None,
             replacement: None,
         };
-        assert!(obsolete_beacon_journal(&entry, 5, 5, false, true, false));
-        assert!(obsolete_beacon_journal(&entry, 5, 5, false, false, true));
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, false, true));
-        assert!(!obsolete_beacon_journal(&entry, 4, 5, false, true, false));
-        assert!(!obsolete_beacon_journal(&entry, 5, 6, false, true, false));
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, true, true, false));
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, false, false));
+        assert!(obsolete_mining_journal(&entry, 5, 5, false, true, false));
+        assert!(obsolete_mining_journal(&entry, 5, 5, false, false, true));
+        assert!(!obsolete_mining_journal(&entry, 5, 5, true, false, true));
+        assert!(!obsolete_mining_journal(&entry, 4, 5, false, true, false));
+        assert!(!obsolete_mining_journal(&entry, 5, 6, false, true, false));
+        assert!(!obsolete_mining_journal(&entry, 5, 5, true, true, false));
+        assert!(!obsolete_mining_journal(&entry, 5, 5, false, false, false));
         entry.state = "confirmed".into();
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true, false));
+        assert!(!obsolete_mining_journal(&entry, 5, 5, false, true, false));
         entry.state = "prepared".into();
         entry.label = "mined-proof".into();
-        assert!(!obsolete_beacon_journal(&entry, 5, 5, false, true, false));
+        assert!(!obsolete_mining_journal(&entry, 5, 5, false, true, false));
     }
 
     #[test]
@@ -1003,7 +1090,7 @@ mod tests {
         assert!(canonical(&json!(1.5)).is_err());
     }
     #[test]
-    fn legacy_signature_recovers_expected_signer() {
+    fn eip155_signature_recovers_expected_signer() {
         let signer = PrivateKeySigner::random();
         let tx = TxLegacy {
             chain_id: Some(CHAIN),

@@ -41,7 +41,7 @@ The binaries are `build/zoru-miner-cli` and `build/zoru-miner-gui`. Use only an 
 The original Qt Quick / QML desktop interface returns with the introductory
 screen, Overview / Wallet / Settings navigation, create or import wallet,
 encrypted backup, light/dark appearance and CPU worker controls. It uses the
-current audited VEX mainnet Rust CLI (zoru-miner-cli serve) for verified
+current VEX mainnet Rust CLI (zoru-miner-cli serve) for verified
 contract checks, mining and reward claims; the old testnet miner is not used.
 Create or import a local wallet, unlock it, then fund a small amount of native
 VEX for gas before enabling mining. This is a development preview, not yet a

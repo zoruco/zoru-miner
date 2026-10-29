@@ -9,9 +9,7 @@ use std::{
     time::Duration,
 };
 
-#[test]
-fn malformed_wallet_finishes_connect_and_releases_the_command_slot() {
-    let directory = tempfile::tempdir().unwrap();
+fn test_manifest(directory: &std::path::Path) -> std::path::PathBuf {
     let mut manifest = json!({
         "schema":"zoru-mainnet-suite-1","chainId":6736,"mode":"local",
         "token":"0x1111111111111111111111111111111111111111",
@@ -27,9 +25,63 @@ fn malformed_wallet_finishes_connect_and_releases_the_command_slot() {
     manifest["manifestSha256"] = json!(hex::encode(Sha256::digest(
         serde_json::to_vec(&manifest).unwrap()
     )));
-    let manifest_path = directory.path().join("manifest.json");
+    let manifest_path = directory.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     zoru_miner::protocol::Manifest::load(&manifest_path).unwrap();
+    manifest_path
+}
+
+#[test]
+fn expected_wallet_mismatch_stops_before_rpc_or_journal_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = test_manifest(directory.path());
+    let wallet = directory.path().join("wallet.json");
+    fs::write(&wallet, include_bytes!("fixtures/pbkdf2-v3.json")).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let root = directory.path().join("root");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zoru-miner-cli"))
+        .arg("inspect")
+        .arg("--manifest")
+        .arg(manifest)
+        .arg("--wallet")
+        .arg(wallet)
+        .args([
+            "--read", &endpoint, "--submit", &endpoint, "--native", &endpoint,
+        ])
+        .args([
+            "--expected-wallet",
+            "0x0000000000000000000000000000000000000001",
+            "--password-stdin",
+        ])
+        .arg("--state-dir")
+        .arg(directory.path().join("state"))
+        .env("ZORU_STATE_ROOT", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "public fixture password").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let event: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["error"], "Wallet does not match --expected-wallet");
+    assert!(
+        !root.exists(),
+        "the wrong wallet must not open signing state"
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn malformed_wallet_finishes_connect_and_releases_the_command_slot() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = test_manifest(directory.path());
     let wallet_path = directory.path().join("wallet.json");
     fs::write(&wallet_path, serde_json::to_vec(&json!({"version":3,"id":"00000000-0000-4000-8000-000000000000","crypto":{
         "cipher":"aes-128-ctr","cipherparams":{"iv":"00".repeat(16)},"ciphertext":"00".repeat(32),"mac":"00".repeat(32),

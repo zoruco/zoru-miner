@@ -281,7 +281,7 @@ fn signed_retry_restart_reorg_and_replacement() {
             .unwrap()
             .is_null()
     );
-    c.reconcile(signer.address(), true).unwrap();
+    c.reconcile(signer.address(), false).unwrap();
     assert_eq!(c.nonce(signer.address(), "latest").unwrap(), nonce + 1);
     let nonce = c.nonce(signer.address(), "latest").unwrap();
     let original = prepared(&c, &signer, nonce, &data, GAS_PRICE);

@@ -18,6 +18,7 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
             submit: cfg["submit"].as_str().unwrap().into(),
             native: "http://127.0.0.1:1".into(),
             wallet: Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),
+            expected_wallet: None,
             state_dir: directory.path().into(),
         },
         Zeroizing::new(cfg["password"].as_str().unwrap().to_owned()),
@@ -37,13 +38,13 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
         .run(Run {
             workers: 4,
             cpu_budget: 0.6,
-            seconds: 35,
+            seconds: 120,
             max_accepted: 1,
         })
         .unwrap();
     assert_eq!(
         result["accepted"], 1,
-        "queued candidates must not overshoot the requested limit"
+        "queued candidates must not overshoot the requested limit: {result}"
     );
     assert_eq!(
         c.number(c.manifest.ledger, "totalProofs()").unwrap(),

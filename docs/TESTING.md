@@ -18,6 +18,8 @@ QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure
 
 Use an isolated Anvil chain with ID **6736**, temporary wallets and disposable funds. The integration test harness reads its own `ZORU_TEST_OPTIONS` configuration. Never use production wallet credentials.
 
+The mining-limit fixture needs blocks to keep advancing during hashing. Start Anvil with `--block-time 1`, or set `evm_setIntervalMining` to one second. With transaction-only mining, the latest block timestamp can lag the pending transaction timestamp and make otherwise valid work expire during gas estimation. Run the signed fixtures sequentially and give each test its own `ZORU_STATE_ROOT`.
+
 ```sh
 cargo test --locked --manifest-path miner/Cargo.toml --test recovery -- --ignored --test-threads=1
 cargo test --locked --manifest-path miner/Cargo.toml --test mining_limit -- --ignored --test-threads=1

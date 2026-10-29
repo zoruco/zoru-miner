@@ -15,11 +15,9 @@ pub struct Proof {
     pub claimed: bool,
     pub reward: Option<U256>,
     pub canonical: bool,
-    #[serde(default)]
     pub claim_block: Option<u64>,
-    /// 1-based proof position from the accepted-proof event. Older journals may omit it.
-    #[serde(default)]
-    pub index_plus_one: Option<U256>,
+    /// 1-based proof position from the accepted-proof event.
+    pub index_plus_one: U256,
 }
 pub struct History {
     db: Mutex<Connection>,
@@ -132,6 +130,6 @@ pub fn proof_record(log: &Value) -> Result<Proof> {
         reward: None,
         canonical: true,
         claim_block: None,
-        index_plus_one: Some(abi::number(data[0]) + U256::from(1)),
+        index_plus_one: abi::number(data[0]) + U256::from(1),
     })
 }

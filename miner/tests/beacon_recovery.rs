@@ -46,11 +46,15 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
                 .unwrap();
             let mut reader = BufReader::new(&mut socket);
             let mut length = 0;
+            let mut route = String::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line == "\r\n" {
                     break;
+                }
+                if line.starts_with("POST ") {
+                    route = line.split_whitespace().nth(1).unwrap().to_owned();
                 }
                 if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
                     length = value.trim().parse().unwrap();
@@ -58,10 +62,14 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            let request: Value = serde_json::from_slice(&body).unwrap();
+            let mut request: Value = serde_json::from_slice(&body).unwrap();
+            request["route"] = json!(route);
             server_calls.lock().unwrap().push(request.clone());
             let result = match request["method"].as_str().unwrap() {
+                "eth_chainId" if route == "/wrong-chain" => json!("0x1"),
                 "eth_chainId" => json!(format!("0x{CHAIN:x}")),
+                "eth_gasPrice" if route == "/submit" => json!("0x2e90edd000"),
+                "eth_gasPrice" => json!("0x22ecb25c00"),
                 "web3_clientVersion" => json!("anvil"),
                 "eth_blockNumber" => json!("0x100"),
                 "eth_getBlockByNumber" => json!({"timestamp":"0x10000"}),
@@ -102,33 +110,70 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
         "runtimeCodeHashes":{}, "approvedImplementationCodeHashes":{}, "manifestSha256":"unused"
     })).unwrap();
     let client = Client::new(
-        manifest,
-        &endpoint,
-        &endpoint,
+        manifest.clone(),
+        &format!("{endpoint}/read"),
+        &format!("{endpoint}/submit"),
         "http://127.0.0.1:1",
         dir.path().join("journal"),
         dir.path().join("receipts"),
     )
     .unwrap();
+    assert_eq!(client.gas_price().unwrap(), 200_000_000_000);
+    let wrong = Client::new(
+        manifest,
+        &format!("{endpoint}/read"),
+        &format!("{endpoint}/wrong-chain"),
+        "http://127.0.0.1:1",
+        dir.path().join("wrong-journal"),
+        dir.path().join("wrong-receipts"),
+    )
+    .unwrap();
+    assert!(
+        wrong
+            .gas_price()
+            .unwrap_err()
+            .to_string()
+            .contains("Wrong EVM chain")
+    );
     let signer = PrivateKeySigner::random();
     let mut hashes = Vec::new();
-    for epoch in [21u64, 22] {
-        let mut input = abi::bytes(&abi::call(
-            "publish(uint48,bytes)",
-            &[
-                abi::uint(U256::from(epoch)),
-                abi::uint(U256::from(64)),
-                abi::uint(U256::from(64)),
-            ],
-        ))
-        .unwrap();
-        input.extend_from_slice(&[0x12; 64]);
+    for (label, epoch) in [
+        ("publish-drand", 21u64),
+        ("publish-drand", 22),
+        ("mined-proof", 23),
+    ] {
+        let (input, recipient) = if label == "publish-drand" {
+            let mut input = abi::bytes(&abi::call(
+                "publish(uint48,bytes)",
+                &[
+                    abi::uint(U256::from(epoch)),
+                    abi::uint(U256::from(64)),
+                    abi::uint(U256::from(64)),
+                ],
+            ))
+            .unwrap();
+            input.extend_from_slice(&[0x12; 64]);
+            (input, beacon)
+        } else {
+            (
+                abi::bytes(&abi::call(
+                    "submit(uint48,address,uint256)",
+                    &[
+                        abi::uint(U256::from(epoch)),
+                        abi::address(signer.address()),
+                        abi::uint(U256::from(7)),
+                    ],
+                ))
+                .unwrap(),
+                client.manifest.ledger,
+            )
+        };
         let tx = TxLegacy {
             chain_id: Some(CHAIN),
             nonce: 5,
             gas_price: 150_000_000_000,
             gas_limit: 900_000,
-            to: beacon.into(),
+            to: recipient.into(),
             value: U256::ZERO,
             input: input.into(),
         };
@@ -138,7 +183,7 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
         hashes.push(hash);
         let record = json!({"chain_id":CHAIN,"account":signer.address(),"nonce":5,
             "hash":hash,"raw":format!("0x{}",hex::encode(raw)),"state":"prepared",
-            "label":"publish-drand","receipt":null,"replacement":null});
+            "label":label,"receipt":null,"replacement":null});
         assert!(record.get("beacon_epoch").is_none());
         let path = client
             .journal
@@ -152,7 +197,7 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
             5
         ));
         let saved: Journal = serde_json::from_slice(&fs::read(archived).unwrap()).unwrap();
-        assert_eq!(saved.state, "superseded-beacon");
+        assert_eq!(saved.state, "superseded");
         assert_eq!(saved.hash, hash);
         assert_eq!(saved.raw, record["raw"].as_str().unwrap());
     }
@@ -161,9 +206,19 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
         fs::read_dir(client.journal.join("resolved"))
             .unwrap()
             .count(),
-        2
+        3
     );
     let calls = calls.lock().unwrap();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call["route"] == "/read" && call["method"] == "eth_gasPrice")
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call["route"] == "/wrong-chain" && call["method"] == "eth_gasPrice")
+    );
     for epoch in [21u64, 22] {
         assert!(calls.iter().any(|call| call["method"] == "eth_call"
             && call["params"][0]["data"]

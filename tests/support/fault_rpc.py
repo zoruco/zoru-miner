@@ -48,11 +48,12 @@ def main():
                 if not 0 < size <= 131072:
                     raise ValueError('Request limit exceeded')
                 body = json.loads(self.rfile.read(size))
-                if body.get('method') != 'eth_sendRawTransaction':
-                    raise ValueError('Only signed submissions are forwarded')
+                method = body.get('method')
+                if method not in ('eth_sendRawTransaction', 'eth_chainId', 'eth_gasPrice'):
+                    raise ValueError('Only submissions and signing preflight are forwarded')
                 response = upstream(body)
                 state = json.loads(control.read_text()) if control.exists() else {}
-                drop = state.get('dropNextSendResponse', 0) > 0
+                drop = method == 'eth_sendRawTransaction' and state.get('dropNextSendResponse', 0) > 0
                 if drop:
                     state['dropNextSendResponse'] -= 1
                     control.write_text(json.dumps(state))

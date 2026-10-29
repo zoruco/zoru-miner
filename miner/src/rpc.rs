@@ -44,7 +44,12 @@ impl Rpc {
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
         {
             let mut last = self.rate.lock().unwrap();
-            let wait = self.interval.saturating_sub(last.elapsed());
+            let interval = if method == "eth_sendRawTransaction" {
+                self.interval
+            } else {
+                self.interval.min(Duration::from_millis(80))
+            };
+            let wait = interval.saturating_sub(last.elapsed());
             if !wait.is_zero() {
                 thread::sleep(wait);
             }
@@ -71,7 +76,24 @@ impl Rpc {
                 "RPC response exceeded the limit"
             );
             let value: Value = serde_json::from_slice(&bytes)?;
+            ensure!(
+                value["jsonrpc"] == "2.0"
+                    && value["id"] == id
+                    && (value.get("result").is_some() ^ value.get("error").is_some()),
+                "{method}: invalid JSON-RPC response envelope"
+            );
             if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let detail = if message.contains("has insufficient ram") {
+                    ": native RAM capacity is exhausted"
+                } else if message.contains("min_inclusion_price") {
+                    ": gas price is below the relay inclusion minimum"
+                } else {
+                    ""
+                };
                 let data = error
                     .get("data")
                     .and_then(Value::as_str)
@@ -80,7 +102,7 @@ impl Rpc {
                     })
                     .unwrap_or_default();
                 bail!(
-                    "{method}: RPC error {} {data}",
+                    "{method}: RPC error {} {data}{detail}",
                     error.get("code").and_then(Value::as_i64).unwrap_or(0)
                 );
             }
@@ -126,8 +148,7 @@ mod tests {
     use super::*;
     use std::{io::Write, net::TcpListener};
 
-    #[test]
-    fn vex_http_headers_are_title_case() {
+    fn serve_response(body: Value) -> (Rpc, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -150,13 +171,13 @@ mod tests {
                 .unwrap()
                 .parse::<usize>()
                 .unwrap();
-            let mut body = vec![0; size];
-            stream.read_exact(&mut body).unwrap();
+            let mut request_body = vec![0; size];
+            stream.read_exact(&mut request_body).unwrap();
             assert_eq!(
-                serde_json::from_slice::<Value>(&body).unwrap()["method"],
+                serde_json::from_slice::<Value>(&request_body).unwrap()["method"],
                 "eth_chainId"
             );
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":"0x1a50"}"#;
+            let body = body.to_string();
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -165,8 +186,58 @@ mod tests {
             .unwrap();
         });
         let rpc = Rpc::new(&format!("http://{address}"), Duration::ZERO).unwrap();
+        (rpc, server)
+    }
+
+    #[test]
+    fn vex_http_headers_are_title_case() {
+        let (rpc, server) = serve_response(json!({"jsonrpc":"2.0","id":1,"result":"0x1a50"}));
         assert_eq!(rpc.request("eth_chainId", json!([])).unwrap(), "0x1a50");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn mismatched_or_ambiguous_rpc_responses_are_rejected() {
+        for response in [
+            json!({"jsonrpc":"2.0","id":2,"result":"0x1a50"}),
+            json!({"id":1,"result":"0x1a50"}),
+            json!({"jsonrpc":"2.0","id":1,"result":"0x1a50","error":{"code":-32000}}),
+            json!({"jsonrpc":"2.0","id":1}),
+        ] {
+            let (rpc, server) = serve_response(response);
+            assert!(
+                rpc.request("eth_chainId", json!([]))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid JSON-RPC response envelope")
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_resource_and_inclusion_failures_are_identifiable_without_echoing_rpc_text() {
+        for (message, expected) in [
+            (
+                "account vex.evm has insufficient ram; needs 5995936 bytes has 5995719 bytes",
+                "native RAM capacity is exhausted",
+            ),
+            (
+                "assertion failure with message: inclusion price must >= min_inclusion_price",
+                "gas price is below the relay inclusion minimum",
+            ),
+        ] {
+            let (rpc, server) = serve_response(
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":message}}),
+            );
+            let error = rpc
+                .request("eth_chainId", json!([]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected));
+            assert!(!error.contains(message));
+            server.join().unwrap();
+        }
     }
 
     #[test]

@@ -12,6 +12,10 @@ A single transaction writer submits accepted candidates and verifies receipt eve
 
 Wallets remain encrypted on disk. The Rust backend handles wallet signing. Signed transactions are journaled before submission. Retries use the original signed bytes. If a nonce is consumed but its canonical outcome cannot be verified, signing stops pending reconciliation.
 
+The expected wallet address is checked before opening signing state or recovering transactions. Recovery reads the mining epoch from the signed calldata and verifies its signer, chain, nonce, destination and hash. A proof or beacon transaction is archived as obsolete only when its hash is absent, both nonce views are unchanged, and its mining epoch is closed. A beacon publication can also be archived after its seed is verified on-chain. Archive names include the transaction hash so reusing a nonce cannot overwrite an earlier record.
+
+New transactions use the submission RPC's `eth_gasPrice` quote after checking its chain ID. The gas limit cannot exceed 22,000,000, and the maximum transaction fee cannot exceed 3.3 VEX. The wallet must cover the quoted maximum fee before signing. See the [JSON-RPC specification](https://ethereum.org/developers/docs/apis/json-rpc/#eth_gasprice).
+
 Per-account local locks do not coordinate separate machines. Keep journals and SQLite state directories stable across upgrades, and avoid sharing an account between hosts.
 
 ## Rewards

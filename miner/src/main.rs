@@ -64,6 +64,7 @@ impl Connection {
             submit: self.submit.clone(),
             native: self.native.clone(),
             wallet: self.wallet.clone(),
+            expected_wallet: self.expected_wallet,
             state_dir: self.state_dir.clone(),
         }
     }
@@ -175,12 +176,6 @@ fn connect(connection: &Connection, password: Zeroizing<String>) -> Result<Arc<S
             "Backend initialization failed; check the wallet and reconnect"
         ))
     })?;
-    if let Some(expected) = connection.expected_wallet {
-        ensure!(
-            session.account == expected,
-            "Wallet does not match --expected-wallet"
-        );
-    }
     Ok(session)
 }
 

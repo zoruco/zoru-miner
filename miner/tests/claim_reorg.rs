@@ -27,6 +27,7 @@ fn orphaned_claims_do_not_remain_in_paid_rewards() {
         submit: cfg["submit"].as_str().unwrap().into(),
         native: "http://127.0.0.1:1".into(),
         wallet: Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),
+        expected_wallet: None,
         state_dir: state.path().into(),
     };
     let session = Session::connect(

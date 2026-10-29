@@ -34,6 +34,7 @@ pub struct Options {
     pub submit: String,
     pub native: String,
     pub wallet: Option<PathBuf>,
+    pub expected_wallet: Option<Address>,
     pub state_dir: PathBuf,
 }
 #[derive(Clone, Copy)]
@@ -75,6 +76,28 @@ fn topic(signature: &str) -> B256 {
 }
 fn topic_address(address: Address) -> String {
     format!("{:#x}", abi::address(address))
+}
+fn receipt_event<'a>(receipt: &'a Value, contract: Address, signature: &str) -> Result<&'a Value> {
+    let expected_topic = format!("{:#x}", topic(signature));
+    let expected_address = format!("{contract:#x}");
+    let mut events = receipt["logs"]
+        .as_array()
+        .context("Receipt logs missing")?
+        .iter()
+        .filter(|log| {
+            log["address"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(&expected_address))
+                && log["topics"][0]
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&expected_topic))
+        });
+    let event = events.next().context("Expected receipt event missing")?;
+    ensure!(
+        events.next().is_none(),
+        "Receipt contains duplicate expected events"
+    );
+    Ok(event)
 }
 fn int(value: &Value) -> Result<U256> {
     abi::quantity(value.as_str().context("Expected RPC quantity")?)
@@ -212,6 +235,12 @@ impl Session {
             .as_ref()
             .map(|v| v.address())
             .unwrap_or(Address::ZERO);
+        if let Some(expected) = options.expected_wallet {
+            ensure!(
+                account == expected,
+                "Wallet does not match --expected-wallet"
+            );
+        }
         let root = storage::default_root()?;
         let lock = if signer.is_some() {
             Some(WriterLock::acquire(
@@ -381,10 +410,7 @@ impl Session {
             let mut my_pending = U256::ZERO;
             let mut my_unclaimed = U256::ZERO;
             for proof in proofs.iter().take(10_000).filter(|p| p.canonical) {
-                let index = match proof.index_plus_one {
-                    Some(index) => index,
-                    None => self.proof_state(proof.digest)?.2,
-                };
+                let index = proof.index_plus_one;
                 let epoch = if let Some(value) = cached_epochs.get(&proof.epoch) {
                     *value
                 } else {
@@ -577,29 +603,21 @@ impl Session {
             data,
             Some(&candidate.work),
         )?;
-        let events: Vec<_> = receipt["logs"]
-            .as_array()
-            .context("Receipt logs missing")?
-            .iter()
-            .filter(|v| {
-                v["address"].as_str().is_some_and(|a| {
-                    a.eq_ignore_ascii_case(&format!("{:#x}", self.client.manifest.ledger))
-                }) && v["topics"][0].as_str().is_some_and(|s| {
-                    s.eq_ignore_ascii_case(&format!(
-                        "{:#x}",
-                        topic("ProofAccepted(uint48,bytes32,address,uint256,uint256)")
-                    ))
-                })
-            })
-            .collect();
-        ensure!(
-            events.len() == 1,
-            "Expected exactly one accepted proof event"
-        );
-        let mut log = events[0].clone();
+        let mut log = receipt_event(
+            &receipt,
+            self.client.manifest.ledger,
+            "ProofAccepted(uint48,bytes32,address,uint256,uint256)",
+        )?
+        .clone();
         log["transactionHash"] = receipt["transactionHash"].clone();
         log["blockNumber"] = receipt["blockNumber"].clone();
         let proof = proof_record(&log)?;
+        ensure!(
+            proof.digest == candidate.digest
+                && proof.epoch == candidate.work.epoch
+                && proof.generation == candidate.work.generation,
+            "Accepted proof differs from submitted work"
+        );
         ensure!(
             log["topics"][3]
                 .as_str()
@@ -610,7 +628,7 @@ impl Session {
         let gas_used: u64 = int(&receipt["gasUsed"])?.try_into()?;
         let mut stats = self.stats.lock().unwrap();
         set_counter(&mut stats, "accepted", 1);
-        stats["events"].as_array_mut().unwrap().push(json!({"hash":proof.hash,"digest":proof.digest,"epoch":proof.epoch,"generation":proof.generation.to_string(),"gasUsed":gas_used,"contextMatched":proof.digest==candidate.digest&&proof.generation==candidate.work.generation,"candidateToReceiptSeconds":started.elapsed().as_secs_f64()}));
+        stats["events"].as_array_mut().unwrap().push(json!({"hash":proof.hash,"digest":proof.digest,"epoch":proof.epoch,"generation":proof.generation.to_string(),"gasUsed":gas_used,"candidateToReceiptSeconds":started.elapsed().as_secs_f64()}));
         Ok(())
     }
     pub fn settle(&self) -> Result<Value> {
@@ -675,18 +693,25 @@ impl Session {
                 None,
             ) {
                 Ok(receipt) => {
-                    for log in receipt["logs"].as_array().context("Claim logs missing")? {
-                        if log["topics"][0].as_str().is_some_and(|v| {
-                            v.eq_ignore_ascii_case(&format!(
-                                "{:#x}",
-                                topic("RewardClaimed(uint48,bytes32,address,uint256)")
-                            ))
-                        }) {
-                            proof.reward =
-                                Some(abi::scalar(log["data"].as_str().unwrap_or_default())?);
-                        }
-                    }
-                    ensure!(proof.reward.is_some(), "Claim receipt has no reward event");
+                    let log = receipt_event(
+                        &receipt,
+                        self.client.manifest.ledger,
+                        "RewardClaimed(uint48,bytes32,address,uint256)",
+                    )?;
+                    ensure!(
+                        log["topics"][1].as_str().map(abi::quantity).transpose()?
+                            == Some(U256::from(proof.epoch))
+                            && log["topics"][2].as_str().is_some_and(
+                                |v| v.eq_ignore_ascii_case(&format!("{:#x}", proof.digest))
+                            )
+                            && log["topics"][3].as_str().is_some_and(
+                                |v| v.eq_ignore_ascii_case(&topic_address(self.account))
+                            ),
+                        "Claim event differs from the accepted proof"
+                    );
+                    proof.reward = Some(abi::scalar(
+                        log["data"].as_str().context("Claim reward missing")?,
+                    )?);
                     proof.claimed = true;
                     proof.claim_block = Some(int(&receipt["blockNumber"])?.try_into()?);
                     self.history.put(&proof)?;
@@ -1052,7 +1077,16 @@ mod beacon_tests {
         let rpc =
             crate::rpc::Rpc::new(fixture["read"].as_str().unwrap(), Duration::from_millis(80))
                 .unwrap();
-        assert_eq!(rpc.request("eth_chainId", json!([])).unwrap(), "0xb690");
+        assert_eq!(
+            abi::quantity(
+                rpc.request("eth_chainId", json!([]))
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            U256::from(crate::protocol::CHAIN)
+        );
         let epoch = fixture["epoch"].as_u64().unwrap();
         let round = U256::from(fixture["round"].as_u64().unwrap());
         let beacon: Address = fixture["beacon"].as_str().unwrap().parse().unwrap();
@@ -1079,8 +1113,35 @@ mod beacon_tests {
 
 #[cfg(test)]
 mod mining_outcome_tests {
-    use super::{is_stale_candidate, mining_outcome};
+    use super::{is_stale_candidate, mining_outcome, receipt_event, topic};
+    use alloy_primitives::Address;
     use serde_json::json;
+
+    #[test]
+    fn receipt_events_require_one_matching_contract_and_signature() {
+        let ledger = Address::repeat_byte(0x12);
+        let signature = "RewardClaimed(uint48,bytes32,address,uint256)";
+        let event = json!({"address":ledger,"topics":[topic(signature)],"data":"0x"});
+        assert!(receipt_event(&json!({"logs":[event.clone()]}), ledger, signature).is_ok());
+        assert!(
+            receipt_event(
+                &json!({"logs":[event.clone()]}),
+                Address::repeat_byte(0x34),
+                signature
+            )
+            .is_err()
+        );
+        assert!(
+            receipt_event(
+                &json!({"logs":[event.clone()]}),
+                ledger,
+                "ProofAccepted(uint48,bytes32,address,uint256,uint256)"
+            )
+            .is_err()
+        );
+        assert!(receipt_event(&json!({"logs":[event.clone(),event]}), ledger, signature).is_err());
+        assert!(receipt_event(&json!({"logs":[]}), ledger, signature).is_err());
+    }
 
     #[test]
     fn stale_before_broadcast_is_warning_not_rejected_proof() {
