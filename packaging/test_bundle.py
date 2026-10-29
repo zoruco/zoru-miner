@@ -31,7 +31,7 @@ class BundleTests(unittest.TestCase):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('Release fixture: ' + name + '\n')
-        for name in ['zoru-miner-cli', 'zoru-miner-gui']:
+        for name in ['zoru-miner-cli', 'zoru-miner-gui', 'libzoru_wallet.so']:
             path = self.build / name
             path.write_bytes(b'fixed executable fixture\n')
             path.chmod(0o755)
@@ -60,7 +60,7 @@ class BundleTests(unittest.TestCase):
                 patch.object(bundle.subprocess, 'run') as ldd, \
                 contextlib.redirect_stdout(io.StringIO()):
             bundle.main()
-            self.assertEqual(ldd.call_count, 2)
+            self.assertEqual(ldd.call_count, 3)
         return output, Path(str(output) + '.tar.gz')
 
     def test_identical_inputs_ignore_file_times_and_output_parent(self):

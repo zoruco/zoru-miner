@@ -36,6 +36,22 @@ cmake --build build -j 1
 
 The binaries are `build/zoru-miner-cli` and `build/zoru-miner-gui`. Use only an authentic release archive with a verified mainnet `deployment.json`.
 
+## Original onboarding interface (v0.1.1 preview branch)
+
+The original Qt Quick / QML desktop interface returns with the introductory
+screen, Overview / Wallet / Settings navigation, create or import wallet,
+encrypted backup, light/dark appearance and CPU worker controls. It uses the
+current audited VEX mainnet Rust CLI (zoru-miner-cli serve) for verified
+contract checks, mining and reward claims; the old testnet miner is not used.
+Create or import a local wallet, unlock it, then fund a small amount of native
+VEX for gas before enabling mining. This is a development preview, not yet a
+published installer. The v0.1.0 packages remain the public release.
+
+Linux GUI additionally requires Qt 6 QML / Quick / Quick Controls modules;
+the .deb installs these as dependencies. The encrypted keystore and locally
+persisted state stay in the user's app data directory. Wallet recovery secrets
+must never be uploaded or shared.
+
 ## Mining and rewards
 
 Set the RPC endpoints before running the CLI. For other VEX EVM endpoints, see [Chainlist](https://chainlist.org/chain/6736) and check the chain ID before connecting:

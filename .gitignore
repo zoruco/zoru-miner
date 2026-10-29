@@ -2,6 +2,7 @@
 /.venv/
 /build*/
 /dist/
+/dist-preview/
 **/__pycache__/
 **/*.egg-info/
 *.wallet.json

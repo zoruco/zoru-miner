@@ -47,7 +47,7 @@ def main():
     if out.exists():
         raise ValueError('Choose a fresh output directory')
     build = Path(args.build_dir).resolve()
-    binaries = ['zoru-miner-cli', 'zoru-miner-gui']
+    binaries = ['zoru-miner-cli', 'zoru-miner-gui', 'libzoru_wallet.so']
     for name in binaries:
         subprocess.run(['ldd', str(build/name)], check=True, stdout=subprocess.DEVNULL)
     out.mkdir(parents=True)
