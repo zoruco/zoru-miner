@@ -28,7 +28,7 @@ def main():
         p = (source / name).resolve()
         if not p.is_relative_to(source) or hashlib.sha256(p.read_bytes()).hexdigest() != checksum:
             raise ValueError('Bundle checksum mismatch')
-    manifest = json.loads((source / 'deployment.json').read_text())
+    manifest = json.loads((source / 'share/zoru-miner/deployment.json').read_text())
     if (manifest.get('chainId') != 6736 or manifest.get('mode') != 'mainnet'
             or manifest.get('schema') != 'zoru-mainnet-suite-1'):
         raise ValueError('Mainnet deployment manifest required')
@@ -43,7 +43,7 @@ def main():
         shutil.copytree(source, target)
         bindir = stage / 'usr/bin'
         bindir.mkdir(parents=True)
-        for binary in ('zoru-miner-cli', 'zoru-miner-gui'):
+        for binary in ('zoru-miner-cli', 'zoru-miner-gui', 'zoru-update'):
             if not (target / 'bin' / binary).is_file():
                 raise ValueError(f'Missing binary: {binary}')
             (bindir / binary).symlink_to('/opt/zoru-miner/bin/' + binary)
@@ -72,7 +72,7 @@ def main():
             'Architecture: amd64\n'
             'Maintainer: ZORU Labs <zorucore@gmail.com>\n'
             'Depends: libc6 (>= 2.34), libstdc++6, libqt6core6 (>= 6.2), '
-            'libqt6gui6 (>= 6.2), libqt6widgets6 (>= 6.2), '
+            'libqt6gui6 (>= 6.2), libqt6widgets6 (>= 6.2), libqt6network6 (>= 6.2), '
             'libqt6qml6 (>= 6.2), libqt6quick6 (>= 6.2), '
             'libqt6quickcontrols2-6 (>= 6.2), qt6-qpa-plugins, '
             'qml6-module-qtquick, qml6-module-qtquick-controls, '

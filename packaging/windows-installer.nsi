@@ -5,6 +5,10 @@
   !error "OUTPUT installer path is required"
 !endif
 
+!ifndef VERSION
+  !error "VERSION is required"
+!endif
+
 Unicode true
 Name "ZORU Miner"
 OutFile "${OUTPUT}"
@@ -28,7 +32,7 @@ Section "ZORU Miner" MainSection
     WriteUninstaller "$INSTDIR\Uninstall.exe"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZORUMiner" "DisplayName" "ZORU Miner"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZORUMiner" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZORUMiner" "DisplayVersion" "0.1.0"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZORUMiner" "DisplayVersion" "${VERSION}"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZORUMiner" "Publisher" "ZORU Labs"
 SectionEnd
 

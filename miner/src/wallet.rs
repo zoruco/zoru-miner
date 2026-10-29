@@ -97,35 +97,54 @@ pub fn unlock(path: &Path, password: Zeroizing<String>) -> Result<PrivateKeySign
     );
     Ok(signer)
 }
-pub fn create(path: &Path, password: Zeroizing<String>) -> Result<Value> {
+pub fn store(
+    path: &Path,
+    signer: &PrivateKeySigner,
+    password: &str,
+    replace: bool,
+) -> Result<Value> {
     ensure!(
-        password.len() >= 12,
+        password.chars().count() >= 12
+            && password.len() <= 1024
+            && !password.contains(['\n', '\r', '\0']),
         "Use at least 12 characters for the wallet password"
     );
-    ensure!(!path.exists(), "Wallet already exists");
+    ensure!(replace || !path.exists(), "Wallet already exists");
     let parent = path
         .parent()
         .filter(|v| !v.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = tempfile::tempdir_in(parent)?;
-    let (signer, _) = PrivateKeySigner::new_keystore(
+    let key = Zeroizing::new(signer.to_bytes().0);
+    PrivateKeySigner::encrypt_keystore(
         temporary.path(),
         &mut rand::thread_rng(),
+        key.as_ref(),
         password.as_bytes(),
         Some("wallet.json"),
     )?;
     let source = temporary.path().join("wallet.json");
+    let mut encrypted: Value = serde_json::from_slice(&fs::read(&source)?)?;
+    encrypted["address"] = json!(format!("{:x}", signer.address()));
+    fs::write(&source, serde_json::to_vec(&encrypted)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
     }
     fs::File::open(&source)?.sync_all()?;
-    fs::hard_link(&source, path)?;
+    if replace {
+        fs::rename(&source, path)?;
+    } else {
+        fs::hard_link(&source, path)?;
+    }
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(json!({"address":signer.address(),"encrypted":true,"wallet":path}))
+}
+pub fn create(path: &Path, password: Zeroizing<String>) -> Result<Value> {
+    store(path, &PrivateKeySigner::random(), &password, false)
 }
 
 #[cfg(test)]

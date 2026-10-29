@@ -28,12 +28,7 @@ def main():
         if not path.is_relative_to(source) or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError('Package checksum mismatch')
     shutil.copytree(source, dest)
-    config = dest/'connection.json'
-    config.write_text(json.dumps({'manifest': str(dest/'deployment.json')}, indent=2)+'\n')
-    launcher = dest/'bin/zoru-miner-desktop'
-    launcher.write_text('#!/bin/sh\nexec '+shlex.quote(str(dest/'bin/zoru-miner-gui'))+' --config '+shlex.quote(str(config))+' "$@"\n')
-    launcher.chmod(0o755)
-    print(json.dumps({'status': 'PASS', 'prefix': str(dest)}))
+    print(json.dumps({'status': 'PASS', 'prefix': str(dest), 'gui': str(dest/'bin/zoru-miner-gui')}))
 
 
 if __name__ == '__main__':

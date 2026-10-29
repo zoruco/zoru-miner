@@ -47,19 +47,20 @@ def main():
     if out.exists():
         raise ValueError('Choose a fresh output directory')
     build = Path(args.build_dir).resolve()
-    binaries = ['zoru-miner-cli', 'zoru-miner-gui', 'libzoru_wallet.so']
+    binaries = ['zoru-miner-cli', 'zoru-miner-gui', 'zoru-update']
     for name in binaries:
-        subprocess.run(['ldd', str(build/name)], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(['ldd', str(build/"bin"/name)], check=True, stdout=subprocess.DEVNULL)
     out.mkdir(parents=True)
     (out/'bin').mkdir()
     for name in binaries:
-        shutil.copy2(build/name, out/'bin'/name)
+        shutil.copy2(build/"bin"/name, out/'bin'/name)
     for name in ['LICENSE', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md']:
         shutil.copy2(ROOT/name, out/name)
     shutil.copytree(ROOT/'licenses', out/'licenses')
     shutil.copytree(ROOT/'docs', out/'docs')
     shutil.copy2(ROOT/'packaging/install.py', out/'install.py')
-    shutil.copy2(args.manifest, out/'deployment.json')
+    (out/'share/zoru-miner').mkdir(parents=True)
+    shutil.copy2(args.manifest, out/'share/zoru-miner/deployment.json')
     checksums = {str(p.relative_to(out)): hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in sorted(out.rglob('*')) if p.is_file()}
     (out/'checksums.json').write_text(json.dumps(checksums, indent=2)+'\n')

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -55,6 +55,12 @@ struct Connection {
     /// Optional expected signer address, checked natively before any signing.
     #[arg(long)]
     expected_wallet: Option<Address>,
+    /// Maximum total gas fees for this session, in wei.
+    #[arg(long)]
+    session_budget_wei: Option<U256>,
+    /// Public account for read-only balances and proof history, without a keystore.
+    #[arg(long)]
+    account: Option<Address>,
 }
 impl Connection {
     fn options(&self) -> Options {
@@ -65,6 +71,9 @@ impl Connection {
             native: self.native.clone(),
             wallet: self.wallet.clone(),
             expected_wallet: self.expected_wallet,
+            fee_budget: self.session_budget_wei,
+            observer: self.account,
+            sync_on_connect: true,
             state_dir: self.state_dir.clone(),
         }
     }
@@ -95,6 +104,9 @@ enum Command {
         /// Stop after this many accepted proofs; 0 has no proof limit.
         #[arg(long, default_value_t = 0)]
         max_accepted: u64,
+        /// Claim eligible rewards after this many accepted proofs; 0 disables it.
+        #[arg(long, default_value_t = 50)]
+        auto_claim_after: u64,
     },
     /// Create an encrypted wallet without overwriting an existing file.
     WalletCreate {
@@ -102,6 +114,11 @@ enum Command {
         wallet: PathBuf,
         #[arg(long)]
         password_stdin: bool,
+    },
+    /// Perform a local wallet operation through the private desktop pipe.
+    WalletManage {
+        #[arg(long)]
+        directory: PathBuf,
     },
     /// Benchmark streamed virtual miners with real hashes and no transactions.
     Stress {
@@ -167,9 +184,15 @@ fn password(stdin: bool) -> Result<Zeroizing<String>> {
         )?))
     }
 }
-fn connect(connection: &Connection, password: Zeroizing<String>) -> Result<Arc<Session>> {
+fn connect(
+    connection: &Connection,
+    password: Zeroizing<String>,
+    sync_history: bool,
+) -> Result<Arc<Session>> {
     let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Session::connect(connection.options(), password, Arc::new(emit))
+        let mut options = connection.options();
+        options.sync_on_connect = sync_history;
+        Session::connect(options, password, Arc::new(emit))
     }))
     .unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
@@ -220,6 +243,11 @@ fn serve(connection: Connection) -> Result<()> {
         if let Some(handle) = active.take() {
             let _ = handle.join();
         }
+        if matches!(action.as_str(), "mine" | "claim")
+            && let Some(session) = holder.lock().unwrap().as_ref()
+        {
+            session.begin_action();
+        }
         let holder = holder.clone();
         let busy = busy.clone();
         let connection = connection.clone();
@@ -232,7 +260,7 @@ fn serve(connection: Connection) -> Result<()> {
                     } else {
                         Zeroizing::new(String::new())
                     };
-                    let session = connect(&connection, secret)?;
+                    let session = connect(&connection, secret, false)?;
                     session.inspect()?;
                     *holder.lock().unwrap() = Some(session);
                     return Ok(());
@@ -248,7 +276,8 @@ fn serve(connection: Connection) -> Result<()> {
                             workers: command["workers"].as_u64().unwrap_or(1) as usize,
                             cpu_budget: command["cpuBudget"].as_f64().unwrap_or(0.5),
                             seconds: command["seconds"].as_u64().unwrap_or(0),
-                            max_accepted: 0,
+                            max_accepted: command["maxAccepted"].as_u64().unwrap_or(0),
+                            auto_claim_after: 0,
                         })?;
                         ensure!(
                             result["runOutcome"] != "failed",
@@ -267,6 +296,9 @@ fn serve(connection: Connection) -> Result<()> {
                 Ok(())
             })();
             if let Err(error) = result {
+                if let Some(session) = holder.lock().unwrap().as_ref() {
+                    let _ = session.publish();
+                }
                 emit(
                     json!({"event":"error","error":error.to_string().chars().take(400).collect::<String>()}),
                 );
@@ -285,6 +317,20 @@ fn serve(connection: Connection) -> Result<()> {
 }
 fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::WalletManage { directory } => {
+            let mut input = Zeroizing::new(String::new());
+            io::stdin().take(16_385).read_to_string(&mut input)?;
+            ensure!(input.len() <= 16_384, "Wallet command is too large");
+            let result = serde_json::from_str(&input)
+                .map_err(anyhow::Error::from)
+                .and_then(|value| zoru_miner::wallet_ipc::execute(&directory, value));
+            emit(match result {
+                Ok(data) => json!({"ok":true,"data":data}),
+                Err(error) => {
+                    json!({"ok":false,"error":error.to_string().chars().take(400).collect::<String>()})
+                }
+            });
+        }
         Command::WalletCreate {
             wallet: target,
             password_stdin,
@@ -342,6 +388,7 @@ fn run() -> Result<()> {
                     cpu_budget,
                     seconds,
                     max_accepted,
+                    auto_claim_after,
                 } => (
                     connection,
                     "mine",
@@ -350,6 +397,7 @@ fn run() -> Result<()> {
                         cpu_budget,
                         seconds,
                         max_accepted,
+                        auto_claim_after,
                     }),
                 ),
                 _ => unreachable!(),
@@ -359,7 +407,8 @@ fn run() -> Result<()> {
             } else {
                 Zeroizing::new(String::new())
             };
-            let session = connect(&connection, secret)?;
+            let session = connect(&connection, secret, true)?;
+            session.begin_action();
             let stop = session.stop.clone();
             ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
             match mode {

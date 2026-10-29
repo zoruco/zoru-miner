@@ -35,6 +35,9 @@ pub struct Options {
     pub native: String,
     pub wallet: Option<PathBuf>,
     pub expected_wallet: Option<Address>,
+    pub observer: Option<Address>,
+    pub sync_on_connect: bool,
+    pub fee_budget: Option<U256>,
     pub state_dir: PathBuf,
 }
 #[derive(Clone, Copy)]
@@ -43,6 +46,7 @@ pub struct Run {
     pub cpu_budget: f64,
     pub seconds: u64,
     pub max_accepted: u64,
+    pub auto_claim_after: u64,
 }
 #[derive(Clone)]
 struct Candidate {
@@ -234,7 +238,12 @@ impl Session {
         let account = signer
             .as_ref()
             .map(|v| v.address())
+            .or(options.observer)
             .unwrap_or(Address::ZERO);
+        ensure!(
+            options.observer.is_none() || signer.is_none(),
+            "Use --account for read-only inspection without a wallet"
+        );
         if let Some(expected) = options.expected_wallet {
             ensure!(
                 account == expected,
@@ -264,6 +273,7 @@ impl Session {
             journal,
             options.state_dir.join("receipts"),
         )?;
+        client.fees.lock().unwrap().set_limit(options.fee_budget)?;
         let revision = client.verify()?;
         if signer.is_some() {
             client.reconcile(account, true)?;
@@ -275,10 +285,10 @@ impl Session {
         )?;
         let paid = history.paid()?;
         let result = Arc::new(Self {
+            stop: client.cancelled.clone(),
             client,
             signer,
             account,
-            stop: Arc::new(AtomicBool::new(false)),
             pause: Arc::new(AtomicBool::new(false)),
             work: Arc::new(RwLock::new(None)),
             stats: Mutex::new(
@@ -290,14 +300,20 @@ impl Session {
             emit,
             revision: Mutex::new(revision),
         });
-        if result.signer.is_some() {
+        if result.account != Address::ZERO && options.sync_on_connect {
+            result.stats.lock().unwrap()["status"] = json!("syncing-history");
+            result.publish()?;
+            if result.signer.is_none() {
+                result.inspect()?;
+            }
             result.sync_history()?;
+            result.stats.lock().unwrap()["status"] = json!("connected");
         }
         result.publish()?;
         Ok(result)
     }
     pub fn publish(&self) -> Result<()> {
-        let data = {
+        let mut data = {
             let mut stats = self.stats.lock().unwrap();
             for key in [
                 "errors",
@@ -315,12 +331,21 @@ impl Session {
             }
             stats.clone()
         };
-        storage::atomic_json(&self.state_dir.join("progress.json"), &data)?;
+        data["fees"] = self.client.fees.lock().unwrap().snapshot();
+        if self.signer.is_some() {
+            storage::atomic_json(&self.state_dir.join("progress.json"), &data)?;
+        }
         (self.emit)(json!({"event":"state","data":data}));
         Ok(())
     }
     fn error(&self, error: anyhow::Error, attempt: bool) {
         let text = short_error(&error);
+        if text.starts_with("FEE_BUDGET_EXHAUSTED:") {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+        if text == "Signing stopped" && self.stop.load(Ordering::Relaxed) {
+            return;
+        }
         let stale = is_stale_candidate(&text);
         let mut stats = self.stats.lock().unwrap();
         if stale {
@@ -348,29 +373,63 @@ impl Session {
     pub fn inspect(&self) -> Result<Value> {
         let c = &self.client;
         let d = &c.manifest;
-        let allocated = c.number(d.ledger, "allocatedSupply()")?;
-        let funded = c.number(d.ledger, "fundedSupply()")?;
-        let paid = c.number(d.ledger, "paidSupply()")?;
-        let (pending, unclaimed) = crate::rewards::split_global_rewards(allocated, funded, paid)?;
-        let total_supply = c.number(d.token, "totalSupply()")?;
-        let lifetime_minted = c.number(d.token, "lifetimeMinted()")?;
-        let total_proofs = c.number(d.ledger, "totalProofs()")?;
-        // epochNow() deliberately reverts before launch. Read the current block
-        // timestamp so pre-launch monitoring never mistakes that for an RPC failure.
+        let inspected_at = Instant::now();
         let block = c
             .read
             .request("eth_getBlockByNumber", json!(["latest", false]))?;
+        let height = block["number"].as_str().context("Block height missing")?;
+        let call = |to: Address, signature: &str, words: &[B256]| -> Result<String> {
+            let result = c.read.request(
+                "eth_call",
+                json!([{"to":to,"data":abi::call(signature, words)},height]),
+            )?;
+            Ok(result.as_str().context("Invalid ABI response")?.to_owned())
+        };
+        let number = |to, signature| abi::scalar(&call(to, signature, &[])?);
+        let allocated = number(d.ledger, "allocatedSupply()")?;
+        let funded = number(d.ledger, "fundedSupply()")?;
+        let paid = number(d.ledger, "paidSupply()")?;
+        let (pending, unclaimed) = crate::rewards::split_global_rewards(allocated, funded, paid)?;
+        let total_supply = number(d.token, "totalSupply()")?;
+        let lifetime_minted = number(d.token, "lifetimeMinted()")?;
+        let total_proofs = number(d.ledger, "totalProofs()")?;
+        let emission_index = number(d.ledger, "emissionIndex()")?;
+        let halving_epochs = number(d.ledger, "HALVING_EPOCHS()")?;
+        let next_budget = abi::scalar(&call(
+            d.ledger,
+            "budgetForIndex(uint256)",
+            &[abi::uint(emission_index)],
+        )?)?;
+        let next_halving = (emission_index / halving_epochs + U256::from(1)) * halving_epochs;
+        let following_budget = abi::scalar(&call(
+            d.ledger,
+            "budgetForIndex(uint256)",
+            &[abi::uint(next_halving)],
+        )?)?;
         let chain_time = int(&block["timestamp"])?;
         let mining_launched = chain_time >= U256::from(d.launch_time);
         let current_epoch = if mining_launched {
-            Some(c.number(d.ledger, "epochNow()")?.to_string())
+            Some(number(d.ledger, "epochNow()")?.to_string())
         } else {
             None
         };
-        let claims_paused = abi::boolean(&c.call(d.ledger, "claimsPaused()", &[])?)?;
-        let admission_paused = abi::boolean(&c.call(d.ledger, "admissionPaused()", &[])?)?;
+        let claims_paused = abi::boolean(&call(d.ledger, "claimsPaused()", &[])?)?;
+        let admission_paused = abi::boolean(&call(d.ledger, "admissionPaused()", &[])?)?;
         let mut data = json!({
             "chainId":6736,
+            "transactionFeeCapWei":crate::protocol::MAX_TRANSACTION_FEE.to_string(),
+            "blockNumber":int(&block["number"])?.to_string(),
+            "blockHash":block["hash"],
+            "blockTimestamp":chain_time.to_string(),
+            "emissionIndex":emission_index.to_string(),
+            "halvingEpochs":halving_epochs.to_string(),
+            "halvingProgressEpochs":(emission_index % halving_epochs).to_string(),
+            "epochsUntilHalving":(next_halving - emission_index).to_string(),
+            "halvingEra":(emission_index / halving_epochs).to_string(),
+            "followingEraBudgetBaseUnits":following_budget.to_string(),
+            "epochSeconds":d.epoch_seconds.to_string(),
+            "nextEmissionBudgetBaseUnits":next_budget.to_string(),
+            "capBaseUnits":number(d.ledger, "CAP()")?.to_string(),
             "contracts":{"token":d.token,"ledger":d.ledger,"engine":d.engine,"beacon":d.beacon,"admin":d.admin},
             "totalSupplyBaseUnits":total_supply.to_string(),
             "lifetimeMintedBaseUnits":lifetime_minted.to_string(),
@@ -387,11 +446,49 @@ impl Session {
             "claimsPaused":claims_paused,
             "admissionPaused":admission_paused
         });
-        if self.signer.is_some() {
+        if let Some(epoch) = &current_epoch {
+            let word = abi::uint(abi::quantity(epoch)?);
+            let info = abi::words(&call(d.ledger, "epochInfo(uint48)", &[word])?)?;
+            ensure!(info.len() == 10, "Invalid epoch schema");
+            data["currentEpochBudgetBaseUnits"] = if abi::number(info[0]) == U256::ZERO {
+                Value::Null
+            } else {
+                json!(abi::number(info[2]).to_string())
+            };
+            data["currentEpochProofs"] = json!(abi::number(info[3]).to_string());
+            let target = call(d.ledger, "targetForEpoch(uint48)", &[word]);
+            data["target"] = match target {
+                Ok(value) => json!(abi::scalar(&value)?.to_string()),
+                Err(error)
+                    if admission_paused
+                        || claims_paused
+                        || error.to_string().ends_with("0xd5b25b63") =>
+                {
+                    Value::Null
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(target) = data["target"].as_str() {
+                let target = abi::quantity(target)?;
+                if target != U256::ZERO {
+                    data["expectedHashes"] = json!((U256::MAX / target).to_string());
+                }
+            }
+            data["beaconVerified"] = json!(
+                abi::scalar(&call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO
+            );
+        }
+        data["fees"] = c.fees.lock().unwrap().snapshot();
+        if self.account != Address::ZERO {
             data["address"] = json!(self.account);
-            data["nativeBalanceWei"] = json!(c.balance(self.account)?.to_string());
+            data["nativeBalanceWei"] = json!(
+                int(&c
+                    .read
+                    .request("eth_getBalance", json!([self.account, height]))?)?
+                .to_string()
+            );
             data["tokenBalanceBaseUnits"] = json!(
-                abi::scalar(&c.call(
+                abi::scalar(&call(
                     d.token,
                     "balanceOf(address)",
                     &[abi::address(self.account)]
@@ -402,7 +499,7 @@ impl Session {
             // not from global supply. A single epoch budget is shared by all proofs.
             // The local history is synced on connection and after settlement.
             let proofs = self.history.pending(10_001)?;
-            let head: u64 = int(&c.read.request("eth_blockNumber", json!([]))?)?.try_into()?;
+            let head: u64 = int(&block["number"])?.try_into()?;
             let synced_at = self.history.cursor()?.unwrap_or(0);
             let complete = proofs.len() <= 10_000
                 && synced_at >= head.saturating_sub(crate::protocol::REORG_WINDOW);
@@ -414,7 +511,7 @@ impl Session {
                 let epoch = if let Some(value) = cached_epochs.get(&proof.epoch) {
                     *value
                 } else {
-                    let state = abi::words(&c.call(
+                    let state = abi::words(&call(
                         d.ledger,
                         "epochInfo(uint48)",
                         &[abi::uint(U256::from(proof.epoch))],
@@ -448,7 +545,30 @@ impl Session {
             data["myClaimedBaseUnits"] = json!(my_claimed.to_string());
             data["myRewardsHistoryComplete"] = json!(complete);
             data["myPendingProofsCounted"] = json!(proofs.len().min(10_000));
+            data["myProofCount"] = json!(self.history.raw_count()?.to_string());
+            data["myClaimedProofs"] = json!(self.history.claimed_count()?.to_string());
+            let mut rows = Vec::new();
+            for proof in self.history.latest(100)? {
+                let mut row = serde_json::to_value(&proof)?;
+                row["epochStart"] =
+                    json!((d.launch_time + proof.epoch * d.epoch_seconds).to_string());
+                rows.push(row);
+            }
+            data["proofs"] = json!(rows);
         }
+        let canonical = c
+            .read
+            .request("eth_getBlockByNumber", json!([height, false]))?;
+        ensure!(
+            block["hash"].as_str().is_some() && canonical["hash"] == block["hash"],
+            "Inspection block changed; refresh the snapshot"
+        );
+        let times = c.read.latencies.lock().unwrap();
+        let latency =
+            times.iter().rev().take(32).copied().sum::<f64>() / times.len().clamp(1, 32) as f64;
+        drop(times);
+        data["rpcLatencyMilliseconds"] = json!(latency * 1000.0);
+        data["inspectionMilliseconds"] = json!(inspected_at.elapsed().as_millis() as u64);
         (self.emit)(json!({"event":"inspection","data":data}));
         Ok(data)
     }
@@ -631,12 +751,20 @@ impl Session {
         stats["events"].as_array_mut().unwrap().push(json!({"hash":proof.hash,"digest":proof.digest,"epoch":proof.epoch,"generation":proof.generation.to_string(),"gasUsed":gas_used,"candidateToReceiptSeconds":started.elapsed().as_secs_f64()}));
         Ok(())
     }
+    pub fn begin_action(&self) {
+        self.stop.store(false, Ordering::SeqCst);
+        self.pause.store(false, Ordering::SeqCst);
+    }
     pub fn settle(&self) -> Result<Value> {
-        self.stop.store(false, Ordering::Relaxed);
+        self.settle_batch(100, true)
+    }
+    fn settle_batch(&self, limit: usize, inspect: bool) -> Result<Value> {
         let signer = self.signer.as_ref().context("Unlock a mainnet wallet")?;
-        self.sync_history()?;
+        if inspect {
+            self.sync_history()?;
+        }
         let mut claims = Vec::new();
-        for mut proof in self.history.pending(100)? {
+        for mut proof in self.history.pending(limit)? {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -715,6 +843,9 @@ impl Session {
                     proof.claimed = true;
                     proof.claim_block = Some(int(&receipt["blockNumber"])?.try_into()?);
                     self.history.put(&proof)?;
+                    self.stats.lock().unwrap()["rewardPaidBaseUnits"] =
+                        json!(self.history.paid()?.to_string());
+                    self.publish()?;
                     claims.push(json!({"digest":proof.digest,"hash":receipt["transactionHash"],"amountBaseUnits":proof.reward.unwrap().to_string()}));
                 }
                 Err(error) => {
@@ -728,7 +859,9 @@ impl Session {
             }
         }
         self.stats.lock().unwrap()["rewardPaidBaseUnits"] = json!(self.history.paid()?.to_string());
-        self.inspect()?;
+        if inspect {
+            self.inspect()?;
+        }
         self.publish()?;
         Ok(json!({"claims":claims}))
     }
@@ -740,13 +873,35 @@ impl Session {
                 && options.cpu_budget <= 2.0,
             "Choose 1,2 or4 workers and at most2 CPU cores"
         );
-        self.stop.store(false, Ordering::Relaxed);
-        self.pause.store(false, Ordering::Relaxed);
+        {
+            let mut stats = self.stats.lock().unwrap();
+            for name in [
+                "accepted",
+                "rejected",
+                "validFound",
+                "hashes",
+                "resourcePauses",
+                "autoClaimed",
+                "staleBeforeBroadcast",
+            ] {
+                stats[name] = json!(0);
+            }
+            for name in [
+                "events",
+                "errors",
+                "warnings",
+                "contexts",
+                "beaconsPublished",
+            ] {
+                stats[name] = json!([]);
+            }
+        }
         let started = Instant::now();
         let cpu_begin = process_cpu();
         let hashes = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
+        let claiming = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel::<Task>(64);
         let run = self.clone();
         let work_tx = tx.clone();
@@ -797,8 +952,11 @@ impl Session {
         });
         let run = self.clone();
         let writer_resource = resource.clone();
+        let writer_claiming = claiming.clone();
         let accepted_limit = options.max_accepted;
         let writer = thread::spawn(move || {
+            let mut claim_retry = Instant::now();
+            let mut claims_remaining = 0;
             while !run.stop.load(Ordering::Relaxed) {
                 // Gate the only transaction writer before it consumes another
                 // queued result. The UI polling interval must not add a proof.
@@ -808,7 +966,52 @@ impl Session {
                     run.stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if run.pause.load(Ordering::Relaxed) || writer_resource.load(Ordering::Relaxed) {
+                if run.pause.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                if options.auto_claim_after > 0 && Instant::now() >= claim_retry {
+                    let pending = match run.history.pending_count() {
+                        Ok(count) => count,
+                        Err(error) => {
+                            run.error(error, false);
+                            0
+                        }
+                    };
+                    if claims_remaining == 0 && pending >= options.auto_claim_after {
+                        claims_remaining = options.auto_claim_after;
+                    }
+                    if claims_remaining == 0 {
+                        claim_retry = Instant::now() + Duration::from_secs(2);
+                    } else {
+                        writer_claiming.store(true, Ordering::Relaxed);
+                        let mut completed = 0;
+                        match run.settle_batch(1, false) {
+                            Ok(result) => {
+                                let count = result["claims"].as_array().map_or(0, Vec::len);
+                                completed = count as u64;
+                                claims_remaining = claims_remaining.saturating_sub(completed);
+                                if count > 0 {
+                                    set_counter(
+                                        &mut run.stats.lock().unwrap(),
+                                        "autoClaimed",
+                                        count as u64,
+                                    );
+                                    (run.emit)(json!({"event":"auto-claims","data":result}));
+                                }
+                            }
+                            Err(error) => run.error(error, false),
+                        }
+                        writer_claiming.store(false, Ordering::Relaxed);
+                        run.stats.lock().unwrap()["autoClaimRemaining"] = json!(claims_remaining);
+                        claim_retry = Instant::now()
+                            + Duration::from_secs(if completed > 0 { 5 } else { 30 });
+                        if run.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                }
+                if writer_resource.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -837,12 +1040,16 @@ impl Session {
             let hashes = hashes.clone();
             let found = found.clone();
             let resources = resource.clone();
+            let claiming = claiming.clone();
             workers.push(thread::spawn(move || {
                 let mut raw = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut raw);
                 let mut nonce = U256::from_be_bytes(raw);
                 while !run.stop.load(Ordering::Relaxed) {
-                    if run.pause.load(Ordering::Relaxed) || resources.load(Ordering::Relaxed) {
+                    if run.pause.load(Ordering::Relaxed)
+                        || resources.load(Ordering::Relaxed)
+                        || claiming.load(Ordering::Relaxed)
+                    {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
@@ -885,7 +1092,9 @@ impl Session {
             let mut stats = self.stats.lock().unwrap();
             stats["workers"] = json!(options.workers);
             stats["cpuBudgetCores"] = json!(options.cpu_budget);
+            stats["autoClaimAfter"] = json!(options.auto_claim_after);
         }
+        let mut runtime_error = None;
         loop {
             if self.stop.load(Ordering::Relaxed)
                 || (options.seconds > 0
@@ -903,6 +1112,8 @@ impl Session {
             }
             stats["status"] = json!(if self.pause.load(Ordering::Relaxed) {
                 "paused"
+            } else if claiming.load(Ordering::Relaxed) {
+                "claiming"
             } else if blocked {
                 "paused-resource"
             } else if self.work.read().unwrap().is_none() {
@@ -920,7 +1131,10 @@ impl Session {
                 hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001)
             );
             drop(stats);
-            self.publish()?;
+            if let Err(error) = self.publish() {
+                runtime_error = Some(error);
+                break;
+            }
             thread::sleep(Duration::from_millis(500));
         }
         self.stop.store(true, Ordering::Relaxed);
@@ -929,7 +1143,10 @@ impl Session {
         }
         let _ = poll.join();
         let _ = writer.join();
-        let data = {
+        if let Some(error) = runtime_error {
+            return Err(error);
+        }
+        let mut data = {
             let mut stats = self.stats.lock().unwrap();
             stats["status"] = json!("stopped");
             stats["elapsedSeconds"] = json!(started.elapsed().as_secs_f64());
@@ -941,6 +1158,7 @@ impl Session {
             stats["runOutcome"] = json!(mining_outcome(&stats));
             stats.clone()
         };
+        data["fees"] = self.client.fees.lock().unwrap().snapshot();
         storage::atomic_json(&self.state_dir.join("summary.json"), &data)?;
         self.publish()?;
         (self.emit)(json!({"event":"mine-result","data":data}));

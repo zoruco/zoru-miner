@@ -24,8 +24,13 @@ impl Rpc {
     pub fn new(url: &str, interval: Duration) -> Result<Self> {
         let parsed = reqwest::Url::parse(url)?;
         ensure!(
-            parsed.scheme() == "https"
-                || (parsed.scheme() == "http" && parsed.host_str() == Some("127.0.0.1")),
+            parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && (parsed.scheme() == "https"
+                    || (parsed.scheme() == "http"
+                        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")))),
             "Use HTTPS or a local RPC connection"
         );
         // VEX's HTTP/1 RPC requires conventional header casing.

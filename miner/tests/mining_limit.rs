@@ -19,6 +19,9 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
             native: "http://127.0.0.1:1".into(),
             wallet: Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),
             expected_wallet: None,
+            fee_budget: None,
+            observer: None,
+            sync_on_connect: true,
             state_dir: directory.path().into(),
         },
         Zeroizing::new(cfg["password"].as_str().unwrap().to_owned()),
@@ -40,6 +43,7 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
             cpu_budget: 2.0,
             seconds: 120,
             max_accepted: 1,
+            auto_claim_after: 0,
         })
         .unwrap();
     assert_eq!(

@@ -1,0 +1,2 @@
+#pragma once
+#define ZORU_APP_VERSION "@PROJECT_VERSION@"

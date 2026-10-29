@@ -26,13 +26,14 @@ class BundleTests(unittest.TestCase):
         self.build = self.root / 'build'
         self.source.mkdir()
         self.build.mkdir()
+        (self.build / "bin").mkdir()
         for name in ['LICENSE', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md',
                      'licenses/dependency/LICENSE', 'docs/TESTING.md', 'packaging/install.py']:
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('Release fixture: ' + name + '\n')
-        for name in ['zoru-miner-cli', 'zoru-miner-gui', 'libzoru_wallet.so']:
-            path = self.build / name
+        for name in ['zoru-miner-cli', 'zoru-miner-gui', 'zoru-update']:
+            path = self.build / "bin" / name
             path.write_bytes(b'fixed executable fixture\n')
             path.chmod(0o755)
         self.manifest = self.root / 'manifest.json'
@@ -91,7 +92,7 @@ class BundleTests(unittest.TestCase):
     def test_binary_change_changes_archive_and_checksum(self):
         output, first = self.package('original')
         original = json.loads((output / 'checksums.json').read_text())
-        (self.build / 'zoru-miner-cli').write_bytes(b'different executable fixture\n')
+        (self.build / 'bin/zoru-miner-cli').write_bytes(b'different executable fixture\n')
         changed, second = self.package('changed-binary')
         checksums = json.loads((changed / 'checksums.json').read_text())
         self.assertNotEqual(original['bin/zoru-miner-cli'], checksums['bin/zoru-miner-cli'])
@@ -105,7 +106,7 @@ class BundleTests(unittest.TestCase):
         self.write_manifest(fixture=False)
         changed, second = self.package('changed-manifest')
         checksums = json.loads((changed / 'checksums.json').read_text())
-        self.assertNotEqual(original['deployment.json'], checksums['deployment.json'])
+        self.assertNotEqual(original['share/zoru-miner/deployment.json'], checksums['share/zoru-miner/deployment.json'])
         self.assertNotEqual(first.read_bytes(), second.read_bytes())
 
     def test_wrong_target_suite_rejected_before_packaging(self):

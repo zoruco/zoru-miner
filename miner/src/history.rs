@@ -25,6 +25,7 @@ pub struct History {
 impl History {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS proofs(digest TEXT PRIMARY KEY,status INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS unclaimed ON proofs(status);
@@ -101,6 +102,31 @@ impl History {
     pub fn set_cursor(&self, value: u64) -> Result<()> {
         self.db.lock().unwrap().execute("INSERT INTO metadata VALUES('cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[value.to_string()])?;
         Ok(())
+    }
+    pub fn pending_count(&self) -> Result<u64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM proofs WHERE status=0",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn latest(&self, limit: usize) -> Result<Vec<Proof>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare("SELECT data FROM proofs ORDER BY json_extract(data,'$.block') DESC, rowid DESC LIMIT ?1")?;
+        let values = statement
+            .query_map([limit.min(256) as i64], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(values
+            .into_iter()
+            .map(|s| serde_json::from_str(&s))
+            .collect::<serde_json::Result<_>>()?)
+    }
+    pub fn claimed_count(&self) -> Result<u64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM proofs WHERE status=1",
+            [],
+            |r| r.get(0),
+        )?)
     }
     pub fn raw_count(&self) -> Result<u64> {
         Ok(self

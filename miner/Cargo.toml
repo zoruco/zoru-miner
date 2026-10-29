@@ -1,6 +1,6 @@
 [package]
 name = "zoru-miner"
-version = "0.1.0"
+version = "1.5.4"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
@@ -14,7 +14,7 @@ alloy-consensus = { version = "=2.5.0", features = ["k256"] }
 alloy-eips = "=2.5.0"
 alloy-primitives = { version = "=1.6.0", features = ["serde", "k256"] }
 alloy-signer = "=2.5.0"
-alloy-signer-local = { version = "=2.5.0", features = ["keystore", "zeroize"] }
+alloy-signer-local = { version = "=2.5.0", features = ["keystore", "zeroize", "mnemonic"] }
 anyhow = "=1.0.104"
 clap = { version = "=4.5.50", features = ["derive"] }
 ctrlc = "=3.5.0"
@@ -22,6 +22,8 @@ fs2 = "=0.4.3"
 hex = "=0.4.3"
 libc = "0.2"
 rand = "=0.8.6"
+ring = "=0.17.14"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rpassword = "=7.4.0"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
@@ -31,3 +33,6 @@ sha2 = "=0.10.9"
 tempfile = "3"
 tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
 zeroize = "=1.8.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }

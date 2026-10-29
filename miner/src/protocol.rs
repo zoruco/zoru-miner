@@ -19,7 +19,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +32,9 @@ pub const MAX_TRANSACTION_FEE: u128 = 3_300_000_000_000_000_000;
 pub const NATIVE_ID: &str = "f9f432b1851b5c179d2091a96f593aaed50ec7466b74f89301f957a83e56ce1f";
 pub const DRAND_HASH: &str = "04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3";
 pub const REORG_WINDOW: u64 = 128;
+// Mainnet relay inclusion observed during validation took up to ten seconds.
+// Retain a further five seconds before a proof's 60-second epoch closes.
+const INCLUSION_MARGIN_SECONDS: u64 = 15;
 
 // Custom error InvalidEpoch() on the pinned ZoruLedger Solidity ABI.
 // 0xd5b25b63 = keccak256("InvalidEpoch()")[..4]. This is NOT a
@@ -253,6 +259,7 @@ fn receipt_location(receipt: &Value, expected_hash: B256) -> Result<(u64, B256)>
 }
 
 pub struct Client {
+    pub cancelled: Arc<AtomicBool>,
     pub manifest: Manifest,
     pub read: Rpc,
     pub submit: Rpc,
@@ -261,6 +268,7 @@ pub struct Client {
     pub receipts: PathBuf,
     head: Mutex<(u64, Instant)>,
     pub transactions: Mutex<Vec<Value>>,
+    pub fees: Mutex<crate::fees::Fees>,
 }
 impl Client {
     pub fn new(
@@ -279,6 +287,7 @@ impl Client {
             fs::set_permissions(&journal, fs::Permissions::from_mode(0o700))?;
         }
         let result = Arc::new(Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
             manifest,
             read: Rpc::new(read, Duration::from_millis(80))?,
             submit: Rpc::new(submit, Duration::from_millis(1500))?,
@@ -287,6 +296,7 @@ impl Client {
             receipts,
             head: Mutex::new((0, Instant::now())),
             transactions: Mutex::new(Vec::new()),
+            fees: Mutex::new(crate::fees::Fees::default()),
         });
         result.identity()?;
         Ok(result)
@@ -675,6 +685,7 @@ impl Client {
                 .read
                 .request("eth_getTransactionReceipt", json!([entry.hash]))?;
             if self.canonical_receipt(entry.hash, &receipt)? {
+                self.fees.lock().unwrap().confirm(entry.hash, &receipt)?;
                 let block: u64 = abi::quantity(
                     receipt["blockNumber"]
                         .as_str()
@@ -772,6 +783,7 @@ impl Client {
                             epoch_closed,
                         ) {
                             entry.state = "superseded".into();
+                            self.fees.lock().unwrap().release(entry.hash);
                             self.write_journal(&entry)?;
                             self.archive_journal(&entry)?;
                             continue;
@@ -779,6 +791,11 @@ impl Client {
                     }
                 }
             }
+            let envelope = TxEnvelope::decode_2718_exact(&abi::bytes(&entry.raw)?)?;
+            self.fees.lock().unwrap().reserve(
+                entry.hash,
+                U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas()),
+            )?;
             let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([entry.raw]));
@@ -787,6 +804,7 @@ impl Client {
                 Err(receipt_error) => return Err(broadcast.err().unwrap_or(receipt_error)),
             };
             entry.state = "confirmed".into();
+            self.fees.lock().unwrap().confirm(entry.hash, &receipt)?;
             entry.receipt = Some(receipt);
             self.write_journal(&entry)?;
         }
@@ -800,6 +818,7 @@ impl Client {
         data: String,
         expected: Option<&Work>,
     ) -> Result<Value> {
+        ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
         ensure!(
             [self.manifest.ledger, self.manifest.beacon].contains(&to),
             "Unexpected transaction recipient"
@@ -819,7 +838,7 @@ impl Client {
             ensure!(
                 generation == work.generation
                     && self.epoch()? == work.epoch
-                    && self.now()? < work.end_time.saturating_sub(8),
+                    && self.now()? < work.end_time.saturating_sub(INCLUSION_MARGIN_SECONDS),
                 "STALE_WORK: epoch or generation changed"
             );
         }
@@ -842,6 +861,7 @@ impl Client {
         let gas = estimated.saturating_mul(13) / 10 + 30_000;
         let gas_price = self.gas_price()?;
         let maximum_fee = U256::from(gas) * U256::from(gas_price);
+        self.fees.lock().unwrap().check(maximum_fee)?;
         ensure!(
             gas <= 22_000_000
                 && maximum_fee <= U256::from(MAX_TRANSACTION_FEE)
@@ -850,7 +870,8 @@ impl Client {
         );
         if let Some(work) = expected {
             ensure!(
-                self.epoch()? == work.epoch && self.now()? < work.end_time.saturating_sub(5),
+                self.epoch()? == work.epoch
+                    && self.now()? < work.end_time.saturating_sub(INCLUSION_MARGIN_SECONDS),
                 "STALE_WORK: inclusion window closing"
             );
         }
@@ -863,10 +884,12 @@ impl Client {
             value: U256::ZERO,
             input: Bytes::from(abi::bytes(&data)?),
         };
+        ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
         let signature = signer.sign_hash_sync(&tx.signature_hash())?;
         let envelope = TxEnvelope::from(tx.into_signed(signature));
         let raw = envelope.encoded_2718();
         let hash = abi::keccak(&raw);
+        self.fees.lock().unwrap().reserve(hash, maximum_fee)?;
         if label == "publish-drand" {
             ensure!(
                 to == self.manifest.beacon,
@@ -904,6 +927,7 @@ impl Client {
             }
         }
         let receipt = result.context("Receipt missing")?;
+        self.fees.lock().unwrap().confirm(hash, &receipt)?;
         record.state = "confirmed".into();
         record.receipt = Some(receipt.clone());
         self.write_journal(&record)?;

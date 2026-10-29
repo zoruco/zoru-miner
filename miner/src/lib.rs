@@ -1,4 +1,5 @@
 pub mod abi;
+pub mod fees;
 pub mod history;
 pub mod pow;
 pub mod protocol;
@@ -8,3 +9,6 @@ pub mod session;
 pub mod storage;
 pub mod stress;
 pub mod wallet;
+pub mod wallet_ipc;
+
+pub mod release;
