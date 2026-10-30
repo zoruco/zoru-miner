@@ -49,6 +49,33 @@ fn is_epoch_boundary_revert(error: &anyhow::Error) -> bool {
 
 pub const IMPL_SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
+/// Locate the first canonical block in which an account's nonce has advanced
+/// past a retained transaction nonce. Historical nonce reads let recovery find
+/// replacements regardless of how many blocks have elapsed since submission.
+fn first_block_with_consumed_nonce<F>(head: u64, nonce: u64, mut nonce_at: F) -> Result<Option<u64>>
+where
+    F: FnMut(u64) -> Result<u64>,
+{
+    if nonce_at(head)? <= nonce {
+        return Ok(None);
+    }
+    if nonce_at(0)? > nonce {
+        return Ok(Some(0));
+    }
+
+    let mut low = 1;
+    let mut high = head;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if nonce_at(middle)? > nonce {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Ok(Some(low))
+}
+
 fn verify_evm_chain(rpc: &Rpc) -> Result<()> {
     let chain = rpc.request("eth_chainId", json!([]))?;
     ensure!(
@@ -717,19 +744,25 @@ impl Client {
                 self.write_journal(&entry)?;
             }
             if self.nonce(account, "latest")? > entry.nonce {
-                let head: u64 = abi::quantity(
-                    self.read
-                        .request("eth_blockNumber", json!([]))?
-                        .as_str()
-                        .context("Invalid head")?,
-                )?
-                .try_into()?;
+                let replacement_block =
+                    first_block_with_consumed_nonce(head, entry.nonce, |block| {
+                        self.nonce(account, &format!("0x{block:x}"))
+                    })?;
                 let mut replacement = None;
-                for block in (head.saturating_sub(32)..=head).rev() {
+                if let Some(block) = replacement_block {
                     let data = self.read.request(
                         "eth_getBlockByNumber",
                         json!([format!("0x{block:x}"), true]),
                     )?;
+                    ensure!(!data.is_null(), "Consumed nonce block is unavailable");
+                    ensure!(
+                        abi::quantity(
+                            data["number"]
+                                .as_str()
+                                .context("Consumed nonce block height missing")?,
+                        )? == U256::from(block),
+                        "Consumed nonce block height mismatch"
+                    );
                     for tx in data["transactions"].as_array().into_iter().flatten() {
                         if tx["from"]
                             .as_str()
@@ -743,10 +776,8 @@ impl Client {
                                     .context("Missing hash")?
                                     .parse::<B256>()?,
                             );
+                            break;
                         }
-                    }
-                    if replacement.is_some() {
-                        break;
                     }
                 }
                 ensure!(
@@ -1090,6 +1121,50 @@ mod tests {
         entry.state = "prepared".into();
         entry.label = "mined-proof".into();
         assert!(!obsolete_mining_journal(&entry, 5, 5, false, true, false));
+    }
+
+    #[test]
+    fn nonce_reconciliation_finds_consuming_block_beyond_recent_window() {
+        let head = 20_000;
+        let nonce = 2_800;
+        let consumed_at = 3_907;
+        let mut calls = 0;
+        let block = first_block_with_consumed_nonce(head, nonce, |height| {
+            calls += 1;
+            Ok(if height >= consumed_at {
+                nonce + 1
+            } else {
+                nonce
+            })
+        })
+        .unwrap();
+        assert_eq!(block, Some(consumed_at));
+        assert!(
+            calls <= 18,
+            "binary search should use logarithmic RPC reads"
+        );
+    }
+
+    #[test]
+    fn nonce_reconciliation_handles_unconsumed_and_genesis_nonces() {
+        assert_eq!(
+            first_block_with_consumed_nonce(100, 5, |_| Ok(5)).unwrap(),
+            None
+        );
+        assert_eq!(
+            first_block_with_consumed_nonce(100, 5, |height| {
+                Ok(if height == 0 { 6 } else { 7 })
+            })
+            .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            first_block_with_consumed_nonce(100, 5, |height| {
+                Ok(if height == 100 { 6 } else { 5 })
+            })
+            .unwrap(),
+            Some(100)
+        );
     }
 
     #[test]
