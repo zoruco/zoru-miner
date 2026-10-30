@@ -1025,7 +1025,19 @@ impl Session {
                         if run.work.read().unwrap().as_ref() != Some(&candidate.work) {
                             set_counter(&mut run.stats.lock().unwrap(), "staleBeforeBroadcast", 1);
                         } else if let Err(error) = run.submit_candidate(candidate) {
-                            run.error(error, true)
+                            if is_stale_candidate(&error.to_string()) {
+                                // The protocol's last-moment epoch/generation
+                                // guard can still win a race after the queue
+                                // check. It is a local discard, not an RPC or
+                                // mining failure and never an on-chain reject.
+                                set_counter(
+                                    &mut run.stats.lock().unwrap(),
+                                    "staleBeforeBroadcast",
+                                    1,
+                                );
+                            } else {
+                                run.error(error, true)
+                            }
                         }
                     }
                     Ok(Task::Beacon(epoch)) => {

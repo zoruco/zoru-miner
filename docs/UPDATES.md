@@ -26,7 +26,7 @@ Signing update information does not Authenticode-sign the Windows executable or 
 
 ## ZORU Miner 1.5.4 Windows validation status
 
-The miner now stops producing work at the 15-second relay-inclusion safety cutoff and drops queued candidates as soon as their epoch context is no longer current. This prevents a backlog of stale candidates from reaching the transaction writer.
+The miner stops producing work at the 15-second relay-inclusion safety cutoff, drops queued candidates when their epoch context changes, and counts last-moment stale-context races as local discards. These are tracked in staleBeforeBroadcast, not logged as RPC failures or on-chain rejected proofs.
 
 The 1.5.4 Windows x64 ZIP and NSIS installer were cross-built and packaged, but the Windows desktop UI and runtime have **not been tested on a native Windows machine**. The attempted Wine smoke test did not complete because Wine prefix initialization timed out. Treat Windows UI behavior, mining controls, update installation and wallet flows as unverified until a member records a successful native Windows test. The Windows installer is also not Authenticode-signed.
 

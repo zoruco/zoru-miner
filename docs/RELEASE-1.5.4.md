@@ -3,7 +3,7 @@
 ## Reliability
 
 - Stop mining work at the 15-second relay-inclusion safety cutoff before an epoch ends. The same cutoff predicate is used when validating a proof submission, avoiding unnecessary hashing and queued candidates that cannot be included in time.
-- Stale candidates are discarded locally and remain warnings, not on-chain rejected proofs. Queued results from an old epoch are dropped before the transaction writer, avoiding a burst of per-candidate stale warnings.
+- Stale candidates are discarded locally and counted in staleBeforeBroadcast, not treated as on-chain rejected proofs. Queued results from an old epoch are dropped before the transaction writer; last-moment epoch races are also counted as local discards instead of RPC warnings.
 
 ## Platform validation
 
