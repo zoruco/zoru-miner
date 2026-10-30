@@ -1017,7 +1017,14 @@ impl Session {
                 }
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(Task::Proof(candidate)) => {
-                        if let Err(error) = run.submit_candidate(candidate) {
+                        // The bounded queue may still contain work from the
+                        // previous epoch after the poller has refreshed it.
+                        // Drop those results here instead of logging each one
+                        // as an individual stale-work warning. submit_candidate
+                        // retains its own guard for races after this check.
+                        if run.work.read().unwrap().as_ref() != Some(&candidate.work) {
+                            set_counter(&mut run.stats.lock().unwrap(), "staleBeforeBroadcast", 1);
+                        } else if let Err(error) = run.submit_candidate(candidate) {
                             run.error(error, true)
                         }
                     }

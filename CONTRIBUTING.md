@@ -10,6 +10,7 @@ The Rust backend owns mining rules, signing, transaction recovery, and reward ac
 - Run Rust formatting, Clippy, and the relevant tests from [Testing](docs/TESTING.md).
 - Run isolated signing and recovery tests when changing wallets, nonces, receipts, proof limits, or claims.
 - Include the commands used, outcomes observed, and any tests not run.
+- For Windows desktop or installer changes, record native Windows UI/runtime test results; a cross-build or Wine attempt is not a passing Windows test. If native testing was not possible, state that clearly as unverified.
 - Preserve third-party licenses and required notices.
 
 Do not commit credentials, wallet files, private journals, local deployment records, or test results containing account data. Report exploitable security issues privately as described in [Security](SECURITY.md).

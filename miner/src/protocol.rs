@@ -36,6 +36,10 @@ pub const REORG_WINDOW: u64 = 128;
 // Retain a further five seconds before a proof's 60-second epoch closes.
 const INCLUSION_MARGIN_SECONDS: u64 = 15;
 
+fn mining_window_open(now: u64, end_time: u64) -> bool {
+    now < end_time.saturating_sub(INCLUSION_MARGIN_SECONDS)
+}
+
 // Custom error InvalidEpoch() on the pinned ZoruLedger Solidity ABI.
 // 0xd5b25b63 = keccak256("InvalidEpoch()")[..4]. This is NOT a
 // general-purpose revert suppressor: callers must recheck epochNow() too.
@@ -497,6 +501,13 @@ impl Client {
             return Ok(None);
         }
         let epoch = self.epoch()?;
+        let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
+        // Stop producing work before the relay inclusion safety margin. This
+        // prevents workers from filling the proof queue with candidates that
+        // cannot be included before the epoch closes.
+        if !mining_window_open(now, end_time) {
+            return Ok(None);
+        }
         let generation = self.number(d.ledger, "moduleGeneration()")?;
         // eth_call is executed at "latest". A block may cross the 60-second
         // boundary after epochNow() was read but before targetForEpoch() is
@@ -534,7 +545,7 @@ impl Client {
             epoch,
             seed: seed[0],
             target,
-            end_time: d.launch_time + (epoch + 1) * d.epoch_seconds,
+            end_time,
         };
         let nonce = (U256::from(1) << 128) + U256::from(7);
         let expected = abi::words(&self.call(
@@ -838,7 +849,7 @@ impl Client {
             ensure!(
                 generation == work.generation
                     && self.epoch()? == work.epoch
-                    && self.now()? < work.end_time.saturating_sub(INCLUSION_MARGIN_SECONDS),
+                    && mining_window_open(self.now()?, work.end_time),
                 "STALE_WORK: epoch or generation changed"
             );
         }
@@ -870,8 +881,7 @@ impl Client {
         );
         if let Some(work) = expected {
             ensure!(
-                self.epoch()? == work.epoch
-                    && self.now()? < work.end_time.saturating_sub(INCLUSION_MARGIN_SECONDS),
+                self.epoch()? == work.epoch && mining_window_open(self.now()?, work.end_time),
                 "STALE_WORK: inclusion window closing"
             );
         }
@@ -1080,6 +1090,17 @@ mod tests {
         entry.state = "prepared".into();
         entry.label = "mined-proof".into();
         assert!(!obsolete_mining_journal(&entry, 5, 5, false, true, false));
+    }
+
+    #[test]
+    fn mining_work_closes_at_the_relay_inclusion_safety_margin() {
+        let end = 10_000;
+        let cutoff = end - INCLUSION_MARGIN_SECONDS;
+        assert!(mining_window_open(cutoff - 1, end));
+        assert!(!mining_window_open(cutoff, end));
+        assert!(!mining_window_open(cutoff + 1, end));
+        assert!(!mining_window_open(end, end));
+        assert!(!mining_window_open(u64::MAX, end));
     }
 
     #[test]

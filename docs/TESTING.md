@@ -40,3 +40,7 @@ The CLI includes a bounded transaction-free stress command. It measures local ha
 Use `packaging/bundle.py` with the final verified mainnet deployment manifest, matching binaries, and expected token and Ledger proxy addresses. Run `python3 packaging/test_bundle.py -v`. The resulting archive includes checksums and dependencies' licenses.
 
 Before publication, verify the installation and signed mining/claim behavior on the intended mainnet and retain receipts. A skipped environment-dependent test remains unverified rather than passing.
+
+## Windows UI validation status (1.5.4)
+
+The Windows x64 binaries and installer were cross-built, but no native Windows UI/runtime test has been completed for this release. Wine smoke testing was inconclusive because prefix initialization timed out. Do not mark Windows UI, mining controls, update installation, or wallet flows as tested until a member runs and records those checks on Windows.

@@ -23,3 +23,11 @@ Run the Windows binaries and desktop tests in a Windows runtime before publicati
 Use `packaging/sign-update.py` with the release version, user-facing release notes and the final Linux and Windows installers. It checks installer identity and produces `update.json` for the release. Keep its expiry current when maintaining a release feed. Publish checksums for every downloadable package.
 
 Signing update information does not Authenticode-sign the Windows executable or installer. Do not describe an unsigned Windows installer as code-signed.
+
+## ZORU Miner 1.5.4 Windows validation status
+
+The miner now stops producing work at the 15-second relay-inclusion safety cutoff and drops queued candidates as soon as their epoch context is no longer current. This prevents a backlog of stale candidates from reaching the transaction writer.
+
+The 1.5.4 Windows x64 ZIP and NSIS installer were cross-built and packaged, but the Windows desktop UI and runtime have **not been tested on a native Windows machine**. The attempted Wine smoke test did not complete because Wine prefix initialization timed out. Treat Windows UI behavior, mining controls, update installation and wallet flows as unverified until a member records a successful native Windows test. The Windows installer is also not Authenticode-signed.
+
+The signed in-app update feed for 1.5.4 is not published yet: the available release signing key failed the repository check against the application verification public key. The public verification key was not changed and no unsigned metadata was published. A matching authorized signing key is required before the desktop updater can offer 1.5.4.
