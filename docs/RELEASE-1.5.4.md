@@ -15,4 +15,4 @@ See [UPDATES.md](../docs/UPDATES.md) and [TESTING.md](../docs/TESTING.md) for va
 
 ## In-app update feed
 
-The signed update feed is not published yet because the available release signing key does not match the application's configured verification public key. The verification key was left unchanged; no unsigned or mismatched metadata was published. The desktop updater will not offer 1.5.4 until the matching authorized signing key is available.
+The verification key is restored to the established public key used by v1.5.3 and matches the protected release signing key stored outside the repository. The v1.5.4 feed is signed and published. Builds of v1.5.4 distributed before this correction contain a mismatched trust anchor and require manual replacement; v1.5.3 builds can verify the signed 1.5.4 update.
