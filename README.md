@@ -2,6 +2,8 @@
 
 ZORU Miner provides a desktop app and a Rust command line miner for Vexanium EVM mainnet. Both use the same mining, wallet, transaction and reward code.
 
+[ZORU project home](https://github.com/zoruco/zoruco) · [Protocol and contracts](https://github.com/zoruco/zoru-pow)
+
 ## Install
 
 Download the package for your system from [Releases](https://github.com/zoruco/zoru-miner/releases/latest).
@@ -10,7 +12,7 @@ Download the package for your system from [Releases](https://github.com/zoruco/z
 - **Windows 10 or 11 x64:** run the Windows installer, or extract the portable ZIP and open `bin/zoru-miner-gui.exe`.
 - **Linux portable:** extract the archive and open `bin/zoru-miner-gui`. Qt 6.2 or newer and its QML modules must be installed.
 
-Compare the download with `SHA256SUMS` from the same release. Windows packages are not Authenticode signed. Each package includes the reviewed mainnet deployment manifest.
+Compare the download with `SHA256SUMS.txt` attached to the same release. Windows packages are not Authenticode signed. Each package includes the reviewed mainnet deployment manifest.
 
 ## Desktop
 
