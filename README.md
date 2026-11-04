@@ -6,13 +6,12 @@ ZORU Miner provides a desktop app and a Rust command line miner for Vexanium EVM
 
 ## Install
 
-Download the package for your system from [Releases](https://github.com/zoruco/zoru-miner/releases/latest).
+Download the Linux x86_64 package from [Releases](https://github.com/zoruco/zoru-miner/releases/latest).
 
 - **Debian or Ubuntu:** install the `.deb` with `sudo apt install ./ZORU-Miner-<version>-Linux-amd64.deb`.
-- **Windows 10 or 11 x64:** run the Windows installer, or extract the portable ZIP and open `bin/zoru-miner-gui.exe`.
 - **Linux portable:** extract the archive and open `bin/zoru-miner-gui`. Qt 6.2 or newer and its QML modules must be installed.
 
-Compare the download with `SHA256SUMS.txt` attached to the same release. Windows packages are not Authenticode signed. Each package includes the reviewed mainnet deployment manifest.
+Compare the download with `SHA256SUMS.txt` attached to the same release. Each package includes the reviewed mainnet deployment manifest. A Windows package requires separate runtime validation before publication.
 
 ## Desktop
 
@@ -60,4 +59,4 @@ cmake --build build -j 2
 ./build/bin/zoru-miner-gui
 ```
 
-Read [Contributing](CONTRIBUTING.md), [Testing](docs/TESTING.md), [Architecture](docs/ARCHITECTURE.md) and [Security](SECURITY.md) before changing mining or signing behavior. Build and packaging instructions are in [Releases](docs/UPDATES.md).
+Read [Contributing](CONTRIBUTING.md), [Testing](docs/TESTING.md), [Architecture](docs/ARCHITECTURE.md) and [Security](SECURITY.md) before changing mining or signing behavior. Build and packaging instructions are in [Building releases](docs/RELEASING.md).

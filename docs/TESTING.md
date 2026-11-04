@@ -43,6 +43,6 @@ Use `packaging/bundle.py` with the final verified mainnet deployment manifest, m
 
 Before publication, verify the installation and signed mining/claim behavior on the intended mainnet and retain receipts. A skipped environment-dependent test remains unverified rather than passing.
 
-## Windows UI validation status (1.5.4)
+## Platform coverage
 
-The Windows x64 binaries and installer were cross-built, but no native Windows UI/runtime test has been completed for this release. Wine smoke testing was inconclusive because prefix initialization timed out. Do not mark Windows UI, mining controls, update installation, or wallet flows as tested until a member runs and records those checks on Windows.
+The current release is validated for Linux x86_64. Windows requires its own runtime checks before publication. Earlier cross-build results and their limitations are preserved in [the release history](RELEASE-1.5.4.md).
