@@ -6,6 +6,7 @@ The miner supports the current ZORU mainnet contracts and preserves existing wal
 - Transaction recovery checks the canonical transaction that consumed a nonce, including transactions outside the recent block window.
 - Lost submission responses retain the signed transaction hash for reconciliation before another submission.
 - Trusted RPC fallbacks verify the chain before use.
+- Beacon publication follows the current epoch after slow requests, with bounded retries and no duplicate publication queue.
 - Mining and automatic settlement respect both contract maintenance pauses.
 - Reward history avoids repeated queries for finalized proofs while retaining recent reorganization checks.
 

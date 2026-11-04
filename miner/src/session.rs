@@ -55,13 +55,6 @@ struct Candidate {
     nonce: U256,
     digest: B256,
 }
-// The bounded channel holds under 16 KiB; keep proof results allocation-free.
-#[allow(clippy::large_enum_variant)]
-enum Task {
-    Proof(Candidate),
-    Beacon(u64),
-}
-
 pub struct Session {
     pub client: Arc<Client>,
     signer: Option<PrivateKeySigner>,
@@ -679,6 +672,9 @@ impl Session {
         let signer = self.signer.as_ref().context("Unlock a mainnet wallet")?;
         let c = &self.client;
         let d = &c.manifest;
+        if c.epoch()? != epoch {
+            return Ok(());
+        }
         let word = abi::uint(U256::from(epoch));
         if abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO {
             return Ok(());
@@ -695,7 +691,10 @@ impl Session {
         let (data, signature) = match fetched {
             Ok(beacon) => beacon,
             Err(error) => {
-                if abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO {
+                if c.epoch()? != epoch
+                    || abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)?
+                        != U256::ZERO
+                {
                     return Ok(());
                 }
                 return Err(error);
@@ -934,10 +933,10 @@ impl Session {
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
         let claiming = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::sync_channel::<Task>(64);
+        // Only proof candidates are queued. Beacon publication is selected
+        // from the current epoch by the writer, after any slow transaction.
+        let (tx, rx) = mpsc::sync_channel::<Candidate>(64);
         let run = self.clone();
-        let work_tx = tx.clone();
-        let poll_resource = resource.clone();
         let poll = thread::spawn(move || {
             while !run.stop.load(Ordering::Relaxed) {
                 match run.client.work(run.account) {
@@ -966,13 +965,6 @@ impl Session {
                             }
                         }
                         *run.work.write().unwrap() = fresh.clone();
-                        if fresh.is_none()
-                            && !run.pause.load(Ordering::Relaxed)
-                            && !poll_resource.load(Ordering::Relaxed)
-                            && let Ok(epoch) = run.client.epoch()
-                        {
-                            let _ = work_tx.try_send(Task::Beacon(epoch));
-                        }
                     }
                     Err(error) => {
                         *run.work.write().unwrap() = None;
@@ -988,6 +980,7 @@ impl Session {
         let accepted_limit = options.max_accepted;
         let writer = thread::spawn(move || {
             let mut claim_retry = Instant::now();
+            let mut beacon_retry = Instant::now();
             let mut claims_remaining = 0;
             while !run.stop.load(Ordering::Relaxed) {
                 // Gate the only transaction writer before it consumes another
@@ -1059,8 +1052,21 @@ impl Session {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
+                if !options.dry_run
+                    && run.work.read().unwrap().is_none()
+                    && Instant::now() >= beacon_retry
+                {
+                    if let Err(error) = run
+                        .client
+                        .epoch()
+                        .and_then(|epoch| run.publish_beacon(epoch))
+                    {
+                        run.error(error, false);
+                    }
+                    beacon_retry = Instant::now() + Duration::from_secs(2);
+                }
                 match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Task::Proof(candidate)) => {
+                    Ok(candidate) => {
                         // The bounded queue may still contain work from the
                         // previous epoch after the poller has refreshed it.
                         // Drop those results here instead of logging each one
@@ -1084,15 +1090,6 @@ impl Session {
                             } else {
                                 run.error(error, true)
                             }
-                        }
-                    }
-                    Ok(Task::Beacon(epoch)) => {
-                        let missing = run.work.read().unwrap().is_none();
-                        if missing
-                            && !options.dry_run
-                            && let Err(error) = run.publish_beacon(epoch)
-                        {
-                            run.error(error, false)
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1136,11 +1133,11 @@ impl Session {
                             count += 1;
                             if pow::valid(digest, work.target) {
                                 found.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx.try_send(Task::Proof(Candidate {
+                                let _ = tx.try_send(Candidate {
                                     work: work.clone(),
                                     nonce,
                                     digest,
-                                }));
+                                });
                             }
                             nonce = nonce.wrapping_add(U256::from(1));
                         }
