@@ -4478,7 +4478,7 @@ dependencies = [
 
 [[package]]
 name = "zoru-miner"
-version = "1.5.5"
+version = "1.5.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
