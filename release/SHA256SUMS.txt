@@ -1,5 +1,2 @@
-bbfc9a429d4b9a96a4b245045f8f2701c7623bae49939bd61a6de81675df60e7  dist/ZORU-Miner-1.5.4-Linux-amd64.deb
-f9db8482c6d30a7c712047f420c23acd3449c6fe1854eb65cb275e6629d7737d  dist/ZORU-Miner-1.5.4-Linux-x64.tar.gz
-9bf841baf0efa26893b6f5d65bae7e548c91f3a4a8449401d6bd796b45bbbe18  dist/ZORU-Miner-1.5.4-Windows-x64.zip
-689a3a9ceefad2caed3cff741b465ab9840855647187f7ebfb754aa55ef75aba  dist/ZORU-Miner-1.5.4-Windows-x64.exe
-14207415b3112ed5acd9486c8eecf297ec813e95bdc7d06e94ba5bd8f18ff008  release/update.json
+a05aeb058f1c70e3af7e8d0bee99042a541006cc1537c074e6bc05cb76900639  ZORU-Miner-1.5.5-Linux-amd64.deb
+419378084644c81b11908c6410591f89ecad313e46697ddb748999984810582b  ZORU-Miner-1.5.5-Linux-x86_64.tar.gz
