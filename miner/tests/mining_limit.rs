@@ -1,5 +1,6 @@
 use alloy_primitives::U256;
 use serde_json::{Value, json};
+use std::time::Duration;
 use std::{fs, path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 use zoru_miner::session::{Options, Run, Session};
@@ -36,6 +37,32 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
         .request("evm_setNextBlockTimestamp", json!([next]))
         .unwrap();
     c.read.request("evm_mine", json!([])).unwrap();
+    for paused in [true, false] {
+        let data = zoru_miner::abi::call(
+            "setAdmissionPaused(bool)",
+            &[zoru_miner::abi::uint(U256::from(u8::from(paused)))],
+        );
+        let hash = c
+            .read
+            .request(
+                "eth_sendTransaction",
+                json!([{
+                    "from":c.manifest.owner,"to":c.manifest.ledger,"data":data
+                }]),
+            )
+            .unwrap();
+        c.receipt(
+            hash.as_str().unwrap().parse().unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        if paused {
+            assert!(
+                c.work(session.account).unwrap().is_none(),
+                "maintenance must stop hashing work"
+            );
+        }
+    }
     let before = c.number(c.manifest.ledger, "totalProofs()").unwrap();
     let result = session
         .run(Run {
@@ -44,6 +71,7 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
             seconds: 120,
             max_accepted: 1,
             auto_claim_after: 0,
+            dry_run: false,
         })
         .unwrap();
     assert_eq!(

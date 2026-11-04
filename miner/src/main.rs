@@ -107,6 +107,9 @@ enum Command {
         /// Claim eligible rewards after this many accepted proofs; 0 disables it.
         #[arg(long, default_value_t = 50)]
         auto_claim_after: u64,
+        /// Run the real mining loop without signing or broadcasting transactions.
+        #[arg(long, requires = "account")]
+        dry_run: bool,
     },
     /// Create an encrypted wallet without overwriting an existing file.
     WalletCreate {
@@ -278,6 +281,7 @@ fn serve(connection: Connection) -> Result<()> {
                             seconds: command["seconds"].as_u64().unwrap_or(0),
                             max_accepted: command["maxAccepted"].as_u64().unwrap_or(0),
                             auto_claim_after: 0,
+                            dry_run: false,
                         })?;
                         ensure!(
                             result["runOutcome"] != "failed",
@@ -389,6 +393,7 @@ fn run() -> Result<()> {
                     seconds,
                     max_accepted,
                     auto_claim_after,
+                    dry_run,
                 } => (
                     connection,
                     "mine",
@@ -397,7 +402,8 @@ fn run() -> Result<()> {
                         cpu_budget,
                         seconds,
                         max_accepted,
-                        auto_claim_after,
+                        auto_claim_after: if dry_run { 0 } else { auto_claim_after },
+                        dry_run,
                     }),
                 ),
                 _ => unreachable!(),

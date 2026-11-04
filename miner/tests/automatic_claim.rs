@@ -133,6 +133,7 @@ fn recovered_proofs_trigger_automatic_claim_and_late_work_is_not_signed() {
             seconds: 65,
             max_accepted: 0,
             auto_claim_after: 1,
+            dry_run: false,
         })
         .unwrap();
     monitor.join().unwrap();

@@ -47,6 +47,7 @@ pub struct Run {
     pub seconds: u64,
     pub max_accepted: u64,
     pub auto_claim_after: u64,
+    pub dry_run: bool,
 }
 #[derive(Clone)]
 struct Candidate {
@@ -284,6 +285,7 @@ impl Session {
                 .join(format!("{:#x}-{account:#x}.sqlite", client.manifest.ledger)),
         )?;
         let paid = history.paid()?;
+        let chain_id = client.manifest.chain_id;
         let result = Arc::new(Self {
             stop: client.cancelled.clone(),
             client,
@@ -292,7 +294,7 @@ impl Session {
             pause: Arc::new(AtomicBool::new(false)),
             work: Arc::new(RwLock::new(None)),
             stats: Mutex::new(
-                json!({"status":"connected","address":if account==Address::ZERO{String::new()}else{format!("{account:#x}")},"chainId":6736,"hashes":0,"validFound":0,"accepted":0,"rejected":0,"staleBeforeBroadcast":0,"resourcePauses":0,"hashesPerSecond":0,"rewardPaidBaseUnits":paid.to_string(),"contexts":[],"events":[],"beaconsPublished":[],"errors":[],"warnings":[],"runOutcome":"not-started"}),
+                json!({"status":"connected","address":if account==Address::ZERO{String::new()}else{format!("{account:#x}")},"chainId":chain_id,"hashes":0,"validFound":0,"accepted":0,"rejected":0,"staleBeforeBroadcast":0,"resourcePauses":0,"hashesPerSecond":0,"rewardPaidBaseUnits":paid.to_string(),"contexts":[],"events":[],"beaconsPublished":[],"errors":[],"warnings":[],"runOutcome":"not-started"}),
             ),
             history,
             state_dir: options.state_dir,
@@ -416,7 +418,7 @@ impl Session {
         let claims_paused = abi::boolean(&call(d.ledger, "claimsPaused()", &[])?)?;
         let admission_paused = abi::boolean(&call(d.ledger, "admissionPaused()", &[])?)?;
         let mut data = json!({
-            "chainId":6736,
+            "chainId":d.chain_id,
             "transactionFeeCapWei":crate::protocol::MAX_TRANSACTION_FEE.to_string(),
             "blockNumber":int(&block["number"])?.to_string(),
             "blockHash":block["hash"],
@@ -579,6 +581,8 @@ impl Session {
             .try_into()
             .context("Invalid deployment height")?;
         let head: u64 = int(&c.read.request("eth_blockNumber", json!([]))?)?.try_into()?;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let reorg_start = head.saturating_sub(crate::protocol::REORG_WINDOW);
         let mut start = self
             .history
             .cursor()?
@@ -587,12 +591,15 @@ impl Session {
             .saturating_sub(crate::protocol::REORG_WINDOW)
             .max(initial);
         let mut after = String::new();
-        loop {
-            let recent = self.history.recent(start, &after)?;
+        'recent: loop {
+            let recent = self.history.recent(reorg_start, &after)?;
             if recent.is_empty() {
                 break;
             }
             for mut proof in recent {
+                if Instant::now() >= deadline || self.stop.load(Ordering::Relaxed) {
+                    break 'recent;
+                }
                 after = format!("{:#x}", proof.digest);
                 let record = self.proof_state(proof.digest)?;
                 proof.canonical = record.2 != U256::ZERO && record.0 == self.account;
@@ -604,18 +611,27 @@ impl Session {
                 self.history.put(&proof)?;
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(90);
         while start <= head && Instant::now() < deadline && !self.stop.load(Ordering::Relaxed) {
             let end = head.min(start.saturating_add(9_999));
             let logs=c.read.request("eth_getLogs",json!([{"address":d.ledger,"fromBlock":format!("0x{start:x}"),"toBlock":format!("0x{end:x}"),"topics":[topic("ProofAccepted(uint48,bytes32,address,uint256,uint256)"),Value::Null,Value::Null,topic_address(self.account)]}]))?;
             for log in logs.as_array().context("Invalid event history")? {
                 let mut proof = proof_record(log)?;
-                let record = self.proof_state(proof.digest)?;
-                proof.canonical = record.2 != U256::ZERO && record.0 == self.account;
-                proof.claimed = record.3;
                 if let Some(old) = self.history.get(proof.digest)? {
+                    proof.claimed = old.claimed;
                     proof.reward = old.reward;
                     proof.claim_block = old.claim_block;
+                }
+                // Finalized acceptance and claim logs are the historical index.
+                // Recheck recent state here; settlement independently checks
+                // every pending proof again before signing a transaction.
+                if proof.block >= reorg_start {
+                    let record = self.proof_state(proof.digest)?;
+                    proof.canonical = record.2 != U256::ZERO && record.0 == self.account;
+                    proof.claimed = record.3;
+                }
+                if !proof.canonical || !proof.claimed {
+                    proof.reward = None;
+                    proof.claim_block = None;
                 }
                 self.history.put(&proof)?;
             }
@@ -665,6 +681,9 @@ impl Session {
         let d = &c.manifest;
         let word = abi::uint(U256::from(epoch));
         if abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO {
+            return Ok(());
+        }
+        if c.number(d.ledger, "admissionPaused()")? != U256::ZERO {
             return Ok(());
         }
         let round = abi::scalar(&c.call(d.beacon, "expectedRound(uint48)", &[word])?)?;
@@ -760,6 +779,12 @@ impl Session {
     }
     fn settle_batch(&self, limit: usize, inspect: bool) -> Result<Value> {
         let signer = self.signer.as_ref().context("Unlock a mainnet wallet")?;
+        ensure!(
+            self.client
+                .number(self.client.manifest.ledger, "claimsPaused()")?
+                == U256::ZERO,
+            "Claims are paused by the protocol"
+        );
         if inspect {
             self.sync_history()?;
         }
@@ -866,7 +891,10 @@ impl Session {
         Ok(json!({"claims":claims}))
     }
     pub fn run(self: &Arc<Self>, options: Run) -> Result<Value> {
-        ensure!(self.signer.is_some(), "Unlock a mainnet wallet");
+        ensure!(
+            options.dry_run || self.signer.is_some(),
+            "Unlock a mainnet wallet"
+        );
         ensure!(
             [1, 2, 4].contains(&options.workers)
                 && options.cpu_budget > 0.0
@@ -883,6 +911,7 @@ impl Session {
                 "resourcePauses",
                 "autoClaimed",
                 "staleBeforeBroadcast",
+                "dryRunCandidates",
             ] {
                 stats[name] = json!(0);
             }
@@ -898,6 +927,9 @@ impl Session {
         }
         let started = Instant::now();
         let cpu_begin = process_cpu();
+        let requests_begin = self.client.read.request_count()
+            + self.client.submit.request_count()
+            + self.client.native.request_count();
         let hashes = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
@@ -970,7 +1002,8 @@ impl Session {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                if options.auto_claim_after > 0 && Instant::now() >= claim_retry {
+                if !options.dry_run && options.auto_claim_after > 0 && Instant::now() >= claim_retry
+                {
                     let pending = match run.history.pending_count() {
                         Ok(count) => count,
                         Err(error) => {
@@ -981,7 +1014,18 @@ impl Session {
                     if claims_remaining == 0 && pending >= options.auto_claim_after {
                         claims_remaining = options.auto_claim_after;
                     }
-                    if claims_remaining == 0 {
+                    let claims_open = claims_remaining != 0
+                        && match run
+                            .client
+                            .number(run.client.manifest.ledger, "claimsPaused()")
+                        {
+                            Ok(value) => value == U256::ZERO,
+                            Err(error) => {
+                                run.error(error, false);
+                                false
+                            }
+                        };
+                    if !claims_open {
                         claim_retry = Instant::now() + Duration::from_secs(2);
                     } else {
                         writer_claiming.store(true, Ordering::Relaxed);
@@ -1024,6 +1068,8 @@ impl Session {
                         // retains its own guard for races after this check.
                         if run.work.read().unwrap().as_ref() != Some(&candidate.work) {
                             set_counter(&mut run.stats.lock().unwrap(), "staleBeforeBroadcast", 1);
+                        } else if options.dry_run {
+                            set_counter(&mut run.stats.lock().unwrap(), "dryRunCandidates", 1);
                         } else if let Err(error) = run.submit_candidate(candidate) {
                             if is_stale_candidate(&error.to_string()) {
                                 // The protocol's last-moment epoch/generation
@@ -1042,7 +1088,10 @@ impl Session {
                     }
                     Ok(Task::Beacon(epoch)) => {
                         let missing = run.work.read().unwrap().is_none();
-                        if missing && let Err(error) = run.publish_beacon(epoch) {
+                        if missing
+                            && !options.dry_run
+                            && let Err(error) = run.publish_beacon(epoch)
+                        {
                             run.error(error, false)
                         }
                     }
@@ -1077,14 +1126,13 @@ impl Session {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     };
-                    let mut preimage = pow::preimage(&work, run.account, nonce);
+                    let prepared = pow::PreparedProof::new(&work, run.account);
                     let slice = Instant::now();
                     let deadline = slice + Duration::from_secs_f64(0.01 * duty);
                     let mut count = 0;
                     loop {
                         for _ in 0..32 {
-                            preimage[256..].copy_from_slice(&nonce.to_be_bytes::<32>());
-                            let digest = abi::keccak(&preimage);
+                            let digest = prepared.digest(nonce);
                             count += 1;
                             if pow::valid(digest, work.target) {
                                 found.fetch_add(1, Ordering::Relaxed);
@@ -1111,7 +1159,13 @@ impl Session {
             let mut stats = self.stats.lock().unwrap();
             stats["workers"] = json!(options.workers);
             stats["cpuBudgetCores"] = json!(options.cpu_budget);
-            stats["autoClaimAfter"] = json!(options.auto_claim_after);
+            stats["autoClaimAfter"] = json!(if options.dry_run {
+                0
+            } else {
+                options.auto_claim_after
+            });
+            stats["dryRun"] = json!(options.dry_run);
+            stats["liveTransactions"] = json!(0);
         }
         let mut runtime_error = None;
         loop {
@@ -1174,10 +1228,27 @@ impl Session {
                 hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001)
             );
             stats["processCpuSeconds"] = json!(process_cpu() - cpu_begin);
-            stats["runOutcome"] = json!(mining_outcome(&stats));
+            stats["runOutcome"] = json!(if options.dry_run {
+                "dry-run"
+            } else {
+                mining_outcome(&stats)
+            });
             stats.clone()
         };
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
+        let requests = self.client.read.request_count()
+            + self.client.submit.request_count()
+            + self.client.native.request_count()
+            - requests_begin;
+        data["rpcRequests"] = json!(requests);
+        data["rpcRequestsPerAcceptedProof"] = match data["accepted"].as_u64() {
+            Some(accepted) if accepted > 0 => json!(requests as f64 / accepted as f64),
+            _ => Value::Null,
+        };
+        data["rpcFailovers"] =
+            json!(self.client.read.failover_count() + self.client.submit.failover_count());
+        data["rpcEndpoints"] =
+            json!({"read":self.client.read.active_url(),"submit":self.client.submit.active_url()});
         storage::atomic_json(&self.state_dir.join("summary.json"), &data)?;
         self.publish()?;
         (self.emit)(json!({"event":"mine-result","data":data}));

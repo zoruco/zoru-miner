@@ -28,8 +28,10 @@ use std::{
 };
 
 pub const CHAIN: u64 = 6736;
+pub const TEST_CHAIN: u64 = 46736;
 pub const MAX_TRANSACTION_FEE: u128 = 3_300_000_000_000_000_000;
 pub const NATIVE_ID: &str = "f9f432b1851b5c179d2091a96f593aaed50ec7466b74f89301f957a83e56ce1f";
+pub const TEST_NATIVE_ID: &str = "c6b5914584c79ad99944f4f77fe813fa2e41373058dadc7c19211e03c886a2fa";
 pub const DRAND_HASH: &str = "04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3";
 pub const REORG_WINDOW: u64 = 128;
 // Mainnet relay inclusion observed during validation took up to ten seconds.
@@ -76,11 +78,20 @@ where
     Ok(Some(low))
 }
 
-fn verify_evm_chain(rpc: &Rpc) -> Result<()> {
+fn network_identity(mode: &str, chain: u64) -> Result<Option<&'static str>> {
+    match (mode, chain) {
+        ("mainnet", CHAIN) => Ok(Some(NATIVE_ID)),
+        ("testnet", TEST_CHAIN) => Ok(Some(TEST_NATIVE_ID)),
+        ("local", CHAIN) => Ok(None),
+        _ => bail!("Deployment mode and chain identity do not match"),
+    }
+}
+
+fn verify_evm_chain(rpc: &Rpc, expected: u64) -> Result<()> {
     let chain = rpc.request("eth_chainId", json!([]))?;
     ensure!(
-        abi::quantity(chain.as_str().context("Invalid chain id")?)? == U256::from(CHAIN),
-        "Wrong EVM chain: expected 6736"
+        abi::quantity(chain.as_str().context("Invalid chain id")?)? == U256::from(expected),
+        "Wrong EVM chain: expected {expected}"
     );
     Ok(())
 }
@@ -105,6 +116,8 @@ pub struct Manifest {
     pub runtime_code_hashes: BTreeMap<String, B256>,
     pub approved_implementation_code_hashes: BTreeMap<String, Vec<B256>>,
     pub manifest_sha256: String,
+    #[serde(default)]
+    pub rpc_fallbacks: Vec<String>,
 }
 fn canonical(value: &Value) -> Result<String> {
     Ok(match value {
@@ -153,13 +166,10 @@ impl Manifest {
             "Deployment manifest checksum mismatch"
         );
         ensure!(
-            result.schema == "zoru-mainnet-suite-1" && result.chain_id == CHAIN,
-            "Only ZORU mainnet chain 6736 is enabled"
+            result.schema == "zoru-mainnet-suite-1",
+            "Unsupported deployment manifest schema"
         );
-        ensure!(
-            matches!(result.mode.as_str(), "local" | "mainnet"),
-            "Unknown network mode"
-        );
+        network_identity(&result.mode, result.chain_id)?;
         ensure!(
             result.decimals == 8
                 && result.epoch_seconds == 60
@@ -222,8 +232,8 @@ fn signed_mining_epoch(entry: &Journal, recipient: Address) -> Result<u64> {
     let raw = abi::bytes(&entry.raw)?;
     let tx = TxEnvelope::decode_2718_exact(&raw)?;
     ensure!(
-        entry.chain_id == CHAIN
-            && tx.chain_id() == Some(CHAIN)
+        [CHAIN, TEST_CHAIN].contains(&entry.chain_id)
+            && tx.chain_id() == Some(entry.chain_id)
             && tx.nonce() == entry.nonce
             && tx.to() == Some(recipient)
             && tx.value() == U256::ZERO
@@ -298,6 +308,7 @@ pub struct Client {
     pub journal: PathBuf,
     pub receipts: PathBuf,
     head: Mutex<(u64, Instant)>,
+    validated_work: Mutex<Option<(Work, Address)>>,
     pub transactions: Mutex<Vec<Value>>,
     pub fees: Mutex<crate::fees::Fees>,
 }
@@ -317,15 +328,20 @@ impl Client {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&journal, fs::Permissions::from_mode(0o700))?;
         }
+        let read_rpc = Rpc::new(read, Duration::from_millis(80))?
+            .with_fallbacks(&manifest.rpc_fallbacks, manifest.chain_id)?;
+        let submit_rpc = Rpc::new(submit, Duration::from_millis(1500))?
+            .with_fallbacks(&manifest.rpc_fallbacks, manifest.chain_id)?;
         let result = Arc::new(Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             manifest,
-            read: Rpc::new(read, Duration::from_millis(80))?,
-            submit: Rpc::new(submit, Duration::from_millis(1500))?,
+            read: read_rpc,
+            submit: submit_rpc,
             native: Rpc::new(native, Duration::from_millis(80))?,
             journal,
             receipts,
             head: Mutex::new((0, Instant::now())),
+            validated_work: Mutex::new(None),
             transactions: Mutex::new(Vec::new()),
             fees: Mutex::new(crate::fees::Fees::default()),
         });
@@ -333,8 +349,14 @@ impl Client {
         Ok(result)
     }
     pub fn identity(&self) -> Result<()> {
-        verify_evm_chain(&self.read)?;
-        if self.manifest.mode == "local" {
+        verify_evm_chain(&self.read, self.manifest.chain_id)?;
+        let native = network_identity(&self.manifest.mode, self.manifest.chain_id)?;
+        if let Some(expected) = native {
+            ensure!(
+                self.native.native()?["chain_id"] == expected,
+                "Wrong VEX native network"
+            );
+        } else {
             let version = self.read.request("web3_clientVersion", json!([]))?;
             ensure!(
                 version
@@ -344,18 +366,13 @@ impl Client {
                     .contains("anvil"),
                 "Expected isolated Anvil local chain"
             );
-        } else {
-            ensure!(
-                self.native.native()?["chain_id"] == NATIVE_ID,
-                "Wrong VEX native network"
-            );
         }
         Ok(())
     }
     pub fn health(&self) -> Result<()> {
-        if self.manifest.mode == "mainnet" {
+        if let Some(expected) = network_identity(&self.manifest.mode, self.manifest.chain_id)? {
             let info = self.native.native()?;
-            ensure!(info["chain_id"] == NATIVE_ID, "Wrong VEX native network");
+            ensure!(info["chain_id"] == expected, "Wrong VEX native network");
             let head = info["head_block_num"]
                 .as_u64()
                 .context("Native head is unavailable")?;
@@ -527,7 +544,10 @@ impl Client {
         if now < d.launch_time {
             return Ok(None);
         }
-        let epoch = self.epoch()?;
+        if self.number(d.ledger, "admissionPaused()")? != U256::ZERO {
+            return Ok(None);
+        }
+        let epoch = (now - d.launch_time) / d.epoch_seconds;
         let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
         // Stop producing work before the relay inclusion safety margin. This
         // prevents workers from filling the proof queue with candidates that
@@ -565,7 +585,7 @@ impl Client {
             return Ok(None);
         }
         let work = Work {
-            chain_id: CHAIN,
+            chain_id: self.manifest.chain_id,
             ledger: d.ledger,
             token: d.token,
             generation,
@@ -574,6 +594,15 @@ impl Client {
             target,
             end_time,
         };
+        if self
+            .validated_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(previous, who)| previous == &work && *who == beneficiary)
+        {
+            return Ok(Some(work));
+        }
         let nonce = (U256::from(1) << 128) + U256::from(7);
         let expected = abi::words(&self.call(
             d.ledger,
@@ -589,6 +618,7 @@ impl Client {
             expected.len() == 1 && expected[0] == pow::digest(&work, beneficiary, nonce),
             "Miner and ledger digest domains differ"
         );
+        *self.validated_work.lock().unwrap() = Some((work.clone(), beneficiary));
         Ok(Some(work))
     }
     pub fn balance(&self, account: Address) -> Result<U256> {
@@ -600,7 +630,7 @@ impl Client {
         )
     }
     pub fn gas_price(&self) -> Result<u128> {
-        verify_evm_chain(&self.submit)?;
+        verify_evm_chain(&self.submit, self.manifest.chain_id)?;
         let quote = self.submit.request("eth_gasPrice", json!([]))?;
         let price: u128 = abi::quantity(quote.as_str().context("Invalid gas price")?)?
             .try_into()
@@ -700,11 +730,12 @@ impl Client {
             }
             let mut entry: Journal = serde_json::from_slice(&fs::read(path)?)?;
             ensure!(
-                entry.chain_id == CHAIN && entry.account == account,
+                entry.chain_id == self.manifest.chain_id && entry.account == account,
                 "Journal network or account mismatch"
             );
             if matches!(entry.state.as_str(), "replaced" | "superseded") {
                 self.archive_journal(&entry)?;
+                self.fees.lock().unwrap().release(entry.hash);
                 continue;
             }
             let old = entry
@@ -767,8 +798,11 @@ impl Client {
                         if tx["from"]
                             .as_str()
                             .is_some_and(|v| v.eq_ignore_ascii_case(&format!("{account:#x}")))
-                            && abi::quantity(tx["nonce"].as_str().unwrap_or("0x0"))?
-                                == U256::from(entry.nonce)
+                            && abi::quantity(
+                                tx["nonce"]
+                                    .as_str()
+                                    .context("Consumed transaction nonce missing")?,
+                            )? == U256::from(entry.nonce)
                         {
                             replacement = Some(
                                 tx["hash"]
@@ -784,9 +818,22 @@ impl Client {
                     replacement.is_some(),
                     "Consumed nonce could not be reconciled; review the retained journal"
                 );
+                let replacement_hash = replacement.context("Consumed nonce replacement missing")?;
+                ensure!(
+                    replacement_hash != entry.hash,
+                    "Original consumed transaction receipt is unavailable; retain the journal"
+                );
+                let replacement_receipt = self
+                    .read
+                    .request("eth_getTransactionReceipt", json!([replacement_hash]))?;
+                ensure!(
+                    self.canonical_receipt(replacement_hash, &replacement_receipt)?,
+                    "Consumed nonce replacement receipt is not canonical; retain the journal"
+                );
                 entry.state = "replaced".into();
                 entry.replacement = replacement;
                 self.write_journal(&entry)?;
+                self.fees.lock().unwrap().release(entry.hash);
                 continue;
             }
             if matches!(entry.label.as_str(), "publish-drand" | "mined-proof")
@@ -799,6 +846,16 @@ impl Client {
                     self.manifest.ledger
                 };
                 let epoch = signed_mining_epoch(&entry, recipient)?;
+                let epoch_closed = self.now()?
+                    >= self.manifest.launch_time + (epoch + 1) * self.manifest.epoch_seconds;
+                let admission_paused =
+                    self.number(self.manifest.ledger, "admissionPaused()")? != U256::ZERO;
+                let seed_verified = is_beacon
+                    && abi::scalar(&self.call(
+                        self.manifest.beacon,
+                        "verifiedSeed(uint48)",
+                        &[abi::uint(U256::from(epoch))],
+                    )?)? != U256::ZERO;
                 let latest = self.nonce(account, "latest")?;
                 let pending = self.nonce(account, "pending")?;
                 if latest == entry.nonce && pending == entry.nonce {
@@ -806,32 +863,31 @@ impl Client {
                         .read
                         .request("eth_getTransactionByHash", json!([entry.hash]))?
                         .is_null();
-                    if !known {
-                        let seed_verified = is_beacon
-                            && abi::scalar(&self.call(
-                                self.manifest.beacon,
-                                "verifiedSeed(uint48)",
-                                &[abi::uint(U256::from(epoch))],
-                            )?)? != U256::ZERO;
-                        let epoch_closed = self.now()?
-                            >= self.manifest.launch_time
-                                + (epoch + 1) * self.manifest.epoch_seconds;
-                        if obsolete_mining_journal(
-                            &entry,
-                            latest,
-                            pending,
-                            known,
-                            seed_verified,
-                            epoch_closed,
-                        ) {
-                            entry.state = "superseded".into();
-                            self.fees.lock().unwrap().release(entry.hash);
-                            self.write_journal(&entry)?;
-                            self.archive_journal(&entry)?;
-                            continue;
-                        }
+                    if obsolete_mining_journal(
+                        &entry,
+                        latest,
+                        pending,
+                        known,
+                        seed_verified,
+                        epoch_closed,
+                    ) {
+                        entry.state = "superseded".into();
+                        self.fees.lock().unwrap().release(entry.hash);
+                        self.write_journal(&entry)?;
+                        self.archive_journal(&entry)?;
+                        continue;
                     }
                 }
+                ensure!(
+                    !epoch_closed && !admission_paused && !seed_verified,
+                    "Mining context is unavailable; retain the journal until its nonce can be reconciled"
+                );
+            }
+            if entry.state == "prepared" && matches!(entry.label.as_str(), "claim" | "seal") {
+                ensure!(
+                    self.number(self.manifest.ledger, "claimsPaused()")? == U256::ZERO,
+                    "Claims are paused; retain the settlement journal without rebroadcasting"
+                );
             }
             let envelope = TxEnvelope::decode_2718_exact(&abi::bytes(&entry.raw)?)?;
             self.fees.lock().unwrap().reserve(
@@ -871,6 +927,18 @@ impl Client {
         self.implementations()?;
         self.verify_owner()?;
         let generation = self.number(self.manifest.ledger, "moduleGeneration()")?;
+        if matches!(label, "mined-proof" | "publish-drand") {
+            ensure!(
+                self.number(self.manifest.ledger, "admissionPaused()")? == U256::ZERO,
+                "STALE_WORK: proof admission is paused"
+            );
+        }
+        if matches!(label, "claim" | "seal") {
+            ensure!(
+                self.number(self.manifest.ledger, "claimsPaused()")? == U256::ZERO,
+                "Claims are paused by the protocol"
+            );
+        }
         ensure!(
             generation == self.number(self.manifest.admin, "suiteRevision()")?
                 && self.address(self.manifest.ledger, "protocolAdmin()")? == self.manifest.admin,
@@ -917,7 +985,7 @@ impl Client {
             );
         }
         let tx = TxLegacy {
-            chain_id: Some(CHAIN),
+            chain_id: Some(self.manifest.chain_id),
             nonce,
             gas_price,
             gas_limit: gas,
@@ -939,7 +1007,7 @@ impl Client {
             beacon_epoch_from_calldata(&abi::bytes(&data)?)?;
         }
         let mut record = Journal {
-            chain_id: CHAIN,
+            chain_id: self.manifest.chain_id,
             account,
             nonce,
             hash,
@@ -953,6 +1021,35 @@ impl Client {
         let started = Instant::now();
         let mut result = None;
         for attempt in 0..2 {
+            if attempt != 0 {
+                self.identity()?;
+                self.implementations()?;
+                self.verify_owner()?;
+                if matches!(label, "claim" | "seal") {
+                    ensure!(
+                        self.number(self.manifest.ledger, "claimsPaused()")? == U256::ZERO,
+                        "Claims are paused; retain the signed settlement journal"
+                    );
+                }
+                if matches!(label, "mined-proof" | "publish-drand") {
+                    ensure!(
+                        self.number(self.manifest.ledger, "admissionPaused()")? == U256::ZERO,
+                        "STALE_WORK: admission paused; retain the signed journal"
+                    );
+                    ensure!(
+                        self.epoch()? == signed_mining_epoch(&record, to)?,
+                        "STALE_WORK: signed epoch expired; retain the journal for reconciliation"
+                    );
+                }
+                if let Some(work) = expected {
+                    ensure!(
+                        mining_window_open(self.now()?, work.end_time)
+                            && self.number(self.manifest.ledger, "moduleGeneration()")?
+                                == work.generation,
+                        "STALE_WORK: retry context expired; retain the signed journal"
+                    );
+                }
+            }
             let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([record.raw]));
@@ -997,6 +1094,25 @@ impl Client {
 mod tests {
     use super::*;
     const GAS_PRICE: u128 = 150_000_000_000;
+
+    #[test]
+    fn network_modes_require_their_exact_chain_and_native_identity() {
+        assert_eq!(network_identity("mainnet", CHAIN).unwrap(), Some(NATIVE_ID));
+        assert_eq!(
+            network_identity("testnet", TEST_CHAIN).unwrap(),
+            Some(TEST_NATIVE_ID)
+        );
+        assert_eq!(network_identity("local", CHAIN).unwrap(), None);
+        for (mode, chain) in [
+            ("mainnet", TEST_CHAIN),
+            ("testnet", CHAIN),
+            ("local", TEST_CHAIN),
+            ("mainnet", 1),
+            ("unknown", CHAIN),
+        ] {
+            assert!(network_identity(mode, chain).is_err());
+        }
+    }
 
     #[test]
     fn receipt_identity_must_bind_the_transaction_and_canonical_location() {

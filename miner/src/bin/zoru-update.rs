@@ -428,24 +428,38 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn debian_package_identity_must_match_the_signed_product_version_and_architecture() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let tree = dir.path().join("tree");
-        fs::create_dir_all(tree.join("DEBIAN")).unwrap();
-        let package = dir.path().join("test.deb");
-        for (name, version, architecture, accepted) in [
+        let control_dir = tree.join("DEBIAN");
+        fs::create_dir_all(&control_dir).unwrap();
+        fs::set_permissions(&tree, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&control_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        for (index, (name, version, architecture, accepted)) in [
             ("zoru-miner", "9.0.0", "amd64", true),
             ("other", "9.0.0", "amd64", false),
             ("zoru-miner", "8.0.0", "amd64", false),
             ("zoru-miner", "9.0.0", "arm64", false),
-        ] {
-            fs::write(tree.join("DEBIAN/control"),format!("Package: {name}\nVersion: {version}\nArchitecture: {architecture}\nMaintainer: Test\nDescription: Update identity fixture\n")).unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let package = dir.path().join(format!("test-{index}.deb"));
+            let control_file = control_dir.join("control");
+            fs::write(&control_file,format!("Package: {name}\nVersion: {version}\nArchitecture: {architecture}\nMaintainer: Test\nDescription: Update identity fixture\n")).unwrap();
+            fs::set_permissions(&control_file, fs::Permissions::from_mode(0o644)).unwrap();
             let built = Command::new("/usr/bin/dpkg-deb")
                 .arg("--build")
                 .arg(&tree)
                 .arg(&package)
                 .output()
                 .unwrap();
-            assert!(built.status.success());
+            assert!(
+                built.status.success(),
+                "dpkg-deb failed: {}",
+                String::from_utf8_lossy(&built.stderr)
+            );
             assert_eq!(package_identity(&package, "9.0.0").is_ok(), accepted);
         }
     }

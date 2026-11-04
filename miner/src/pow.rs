@@ -1,6 +1,7 @@
 use crate::abi::{address, keccak, uint};
 use alloy_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
+use tiny_keccak::{Hasher, Keccak};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Work {
@@ -34,6 +35,28 @@ pub fn preimage(work: &Work, beneficiary: Address, nonce: U256) -> [u8; 288] {
 }
 pub fn digest(work: &Work, beneficiary: Address, nonce: U256) -> B256 {
     keccak(&preimage(work, beneficiary, nonce))
+}
+
+/// Reuses the absorbed work prefix while the worker varies the full 256-bit nonce.
+pub struct PreparedProof {
+    prefix: Keccak,
+}
+
+impl PreparedProof {
+    pub fn new(work: &Work, beneficiary: Address) -> Self {
+        let data = preimage(work, beneficiary, U256::ZERO);
+        let mut prefix = Keccak::v256();
+        prefix.update(&data[..256]);
+        Self { prefix }
+    }
+
+    pub fn digest(&self, nonce: U256) -> B256 {
+        let mut hash = self.prefix.clone();
+        hash.update(&nonce.to_be_bytes::<32>());
+        let mut result = [0u8; 32];
+        hash.finalize(&mut result);
+        B256::from(result)
+    }
 }
 pub fn valid(digest: B256, target: U256) -> bool {
     U256::from_be_slice(digest.as_slice()) < target
@@ -74,5 +97,33 @@ mod tests {
         assert_ne!(digest(&work, Address::repeat_byte(5), U256::MAX), base);
         assert_ne!(digest(&work, who, U256::MAX - U256::from(1)), base);
         assert_eq!(&preimage(&work, who, U256::MAX)[256..], &[255u8; 32]);
+    }
+
+    #[test]
+    fn prepared_prefix_matches_full_preimage_across_domain_and_nonce_boundaries() {
+        for domain in 0..16u64 {
+            let work = Work {
+                chain_id: 6736 + domain,
+                ledger: Address::repeat_byte(domain as u8),
+                token: Address::repeat_byte((domain + 1) as u8),
+                generation: U256::MAX - U256::from(domain),
+                epoch: (1u64 << 48) - 1 - domain,
+                seed: B256::repeat_byte((domain + 2) as u8),
+                target: U256::MAX >> 16,
+                end_time: 0,
+            };
+            let beneficiary = Address::repeat_byte((domain + 3) as u8);
+            let prepared = PreparedProof::new(&work, beneficiary);
+            for nonce in [
+                U256::ZERO,
+                U256::from(1),
+                U256::from(u64::MAX),
+                U256::from(1) << 128,
+                (U256::from(1) << 128) - U256::from(1),
+                U256::MAX,
+            ] {
+                assert_eq!(prepared.digest(nonce), digest(&work, beneficiary, nonce));
+            }
+        }
     }
 }

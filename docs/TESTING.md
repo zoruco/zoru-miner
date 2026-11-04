@@ -29,6 +29,8 @@ cargo test --release --locked --manifest-path miner/Cargo.toml --test automatic_
 
 These tests cover nonce recovery, duplicate-proof handling, receipt verification, accepted work, claim accounting, and reorganization behavior. Keep separate state directories and signing journals for every independent chain.
 
+The isolated native VEX suite uses manifest mode `testnet`, EVM chain 46736 and its expected native genesis. This mode cannot sign on mainnet. Production manifests require mode `mainnet`, EVM chain 6736 and the mainnet native identity. Native tests separately exercise real authenticated drand mining, two miners, automatic settlement, both maintenance pauses, restarts, delayed RPC calls, an HTTP outage and loss of an accepted submission response. Storage load tests with a permissive accounting engine are reported separately from Keccak mining throughput.
+
 ## Read-only network checks
 
 Test CLI and GUI connectivity against the confirmed mainnet deployment on chain 6736. Check bytecode, owner, issuer, and reward readings before signed mining tests.

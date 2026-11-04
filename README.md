@@ -44,6 +44,8 @@ The CLI claims eligible rewards automatically once at least 50 accepted proofs r
 
 Use `rewards` with the same connection options for balances and rewards, or `claim` for a manual claim session. A public `--account <address>` allows read-only reward inspection without opening a wallet. `--session-budget-wei` optionally limits total fees for one CLI session; without it the CLI has no session allowance.
 
+The release manifest can specify trusted RPC fallbacks. Each fallback must report the declared chain before use. A lost submission response is reconciled through its retained transaction hash and nonce before another transaction is considered. Preserve the state directory and journals across restarts. Both contract maintenance pauses stop mining and automatic settlement.
+
 Mining and claiming spend VEX. Accepted proofs share an epoch budget, and mining does not guarantee a profit. Never put a private key or password in a command argument, log or issue.
 
 ## Build and contribute

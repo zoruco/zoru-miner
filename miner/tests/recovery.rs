@@ -41,6 +41,10 @@ fn rpc_fee_quote_is_signed_and_total_fee_budget_blocks_excessive_quotes() {
     )
     .unwrap();
     c.verify().unwrap();
+    // Keep the quote stable while checking exact signing. Other fixtures use
+    // interval mining to exercise real epoch progress during hashing.
+    c.read.request("evm_setIntervalMining", json!([0])).unwrap();
+    c.read.request("anvil_setAutomine", json!([true])).unwrap();
     let set_base = |price: u128| {
         c.read
             .request(
@@ -95,6 +99,7 @@ fn rpc_fee_quote_is_signed_and_total_fee_budget_blocks_excessive_quotes() {
             )
     );
     set_base(1_000_000_000);
+    c.read.request("evm_setIntervalMining", json!([1])).unwrap();
 }
 
 fn prepared(
@@ -316,7 +321,7 @@ fn signed_retry_restart_reorg_and_replacement() {
     );
     assert!(fs::read_dir(c.journal.join("resolved")).unwrap().count() >= 5);
 
-    // A consumed nonce outside the bounded lookup must retain the original intent.
+    // A replacement older than the former lookup window must still reconcile.
     let nonce = c.nonce(signer.address(), "latest").unwrap();
     let data = abi::call(
         "openEpoch(uint48)",
@@ -330,7 +335,32 @@ fn signed_retry_restart_reorg_and_replacement() {
         .unwrap();
     c.receipt(cancellation.hash, Duration::from_secs(10))
         .unwrap();
-    c.read.request("anvil_mine", json!(["0x21"])).unwrap();
+    c.read.request("anvil_mine", json!(["0x101"])).unwrap();
+    c.reconcile(signer.address(), true).unwrap();
+    let saved: Journal = serde_json::from_slice(
+        &fs::read(
+            c.journal
+                .join(format!("{:#x}-{:020}.json", signer.address(), nonce)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved.state, "replaced");
+    assert_eq!(saved.replacement, Some(cancellation.hash));
+    assert_eq!(saved.hash, unresolved.hash);
+    assert_eq!(saved.raw, unresolved.raw);
+    c.reconcile(signer.address(), true).unwrap();
+
+    // A synthetic nonce increase with no consuming transaction must fail closed.
+    let nonce = c.nonce(signer.address(), "latest").unwrap();
+    let unresolved = prepared(&c, &signer, nonce, &data, GAS_PRICE);
+    record(&c, &unresolved);
+    c.read
+        .request(
+            "anvil_setNonce",
+            json!([signer.address(), format!("0x{:x}", nonce + 1)]),
+        )
+        .unwrap();
     for _ in 0..2 {
         let error = c.reconcile(signer.address(), true).unwrap_err();
         assert!(
@@ -351,6 +381,12 @@ fn signed_retry_restart_reorg_and_replacement() {
         assert_eq!(saved.hash, unresolved.hash);
         assert_eq!(saved.raw, unresolved.raw);
     }
-    let report = json!({"status":"PASS","signedByRust":true,"lostResponse":true,"duplicateProof":true,"restartBeforeBroadcast":true,"restartAfterBroadcast":true,"orphanedReceiptReplay":true,"sameNonceReplacement":true,"unresolvedConsumedNonceFailsClosed":true,"signer":signer.address(),"proofTransaction":receipt["transactionHash"]});
+    c.read
+        .request(
+            "anvil_setNonce",
+            json!([signer.address(), format!("0x{nonce:x}")]),
+        )
+        .unwrap();
+    let report = json!({"status":"PASS","signedByRust":true,"lostResponse":true,"duplicateProof":true,"restartBeforeBroadcast":true,"restartAfterBroadcast":true,"orphanedReceiptReplay":true,"sameNonceReplacement":true,"historicalReplacementBeyondWindow":true,"unresolvedConsumedNonceFailsClosed":true,"signer":signer.address(),"proofTransaction":receipt["transactionHash"]});
     storage::atomic_json(&PathBuf::from(options["report"].as_str().unwrap()), &report).unwrap();
 }
