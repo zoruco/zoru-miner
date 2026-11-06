@@ -18,8 +18,24 @@ def main():
     args = parser.parse_args()
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--format-version', '1', '--filter-platform', args.target,
                                                     '--manifest-path', str(ROOT/'miner/Cargo.toml')], text=True))
+    index = ROOT/'licenses/dependencies.json'
+    indexed = {}
+    if index.exists():
+        indexed = {
+            (entry['name'], entry['version']): entry
+            for entry in json.loads(index.read_text())
+        }
     out = ROOT/'licenses/dependencies'
+    # Some registry archives omit notices that were separately verified for an
+    # exact package version. Retain those copies when updating dependency data.
+    previous = {}
     if out.exists():
+        for directory in out.iterdir():
+            if directory.is_dir():
+                previous[directory.name] = {
+                    entry.name: entry.read_bytes()
+                    for entry in directory.iterdir() if entry.is_file()
+                }
         shutil.rmtree(out)
     out.mkdir(parents=True)
     records = []
@@ -36,7 +52,11 @@ def main():
         target.mkdir()
         for path in files:
             shutil.copy2(path, target/path.name)
-        upstream = []
+        if not files:
+            for name, content in previous.get(target.name, {}).items():
+                (target/name).write_bytes(content)
+        prior = indexed.get((package['name'], package['version']), {})
+        upstream = prior.get('upstreamNotices', []) if not files else []
         if not files and args.fetch_missing:
             vcs = source/'.cargo_vcs_info.json'
             repository = urllib.parse.urlsplit(package.get('repository') or '')

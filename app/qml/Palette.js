@@ -21,7 +21,13 @@ function amountSummary(value, decimals) {
     fraction = fraction.slice(0, places).replace(/0+$/, "")
     if (whole === "0" && !/[1-9]/.test(fraction) && approximate)
         return (match[1] ? "−" : "") + (places ? "<0." + new Array(places).join("0") + "1" : "<1")
-    return (approximate ? "≈ " : "") + match[1] + whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (fraction ? "." + fraction : "")
+    // Group exact decimal strings by position, without regex zero-width replacements.
+    var grouped = ""
+    for (var i = 0; i < whole.length; i++) {
+        if (i > 0 && (whole.length - i) % 3 === 0) grouped += ","
+        grouped += whole.charAt(i)
+    }
+    return (approximate ? "≈ " : "") + match[1] + grouped + (fraction ? "." + fraction : "")
 }
 function contains(values, value) { return values.indexOf(value) >= 0 }
 function rewardPaid(row) {

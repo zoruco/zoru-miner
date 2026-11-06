@@ -49,3 +49,9 @@ Open **Settings → Software Updates → Check for Updates**. When an update is 
 On Debian or Ubuntu, approve the system administrator request if prompted. Windows closes the app before replacing its files. Mining stops for installation, and starting a new session requires a new authorization.
 
 Updates do not need your wallet password or recovery details. Your wallet, preferences and mining history are stored outside the installation directory.
+
+## Existing encrypted wallets
+
+A wallet created by an earlier ZORU Miner desktop version may use the original ZORU encrypted wallet format. On the first successful unlock, the application verifies its password and address, archives the original encrypted wallet under the application's `wallet-archives` directory, and creates a Web3 v3 keystore for the same address. An incorrect password leaves the original file untouched. The original archive is retained for recovery, including encrypted recovery-phrase information not represented in Web3 v3.
+
+If the desktop menu still contains an older ZORU Miner launcher, run `zoru-clean-launchers` to preview obsolete user shortcuts, then `zoru-clean-launchers --apply` to archive them. Run it as your regular desktop user, not with `sudo`. The current launcher and wallet files remain untouched.

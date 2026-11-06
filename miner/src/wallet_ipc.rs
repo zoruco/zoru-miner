@@ -1,4 +1,4 @@
-use crate::{storage::WriterLock, wallet};
+use crate::{storage::WriterLock, wallet, wallet_migration};
 use alloy_primitives::Address;
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner};
 use anyhow::{Context, Result, bail, ensure};
@@ -47,12 +47,16 @@ pub fn execute(directory: &Path, mut command: Value) -> Result<Value> {
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 1024 * 1024, "Wallet file is too large");
         let value: Value = serde_json::from_slice(&bytes).context("The wallet file is damaged")?;
-        ensure!(value["version"] == 3, "Expected a Web3 version 3 wallet");
+        if wallet_migration::recognizes(&value) {
+            let address = wallet_migration::address(&path)?;
+            return Ok(json!({"exists":true,"address":address,"needsMigration":true}));
+        }
+        ensure!(value["version"] == 3, "Unsupported encrypted wallet format");
         let address = value["address"].as_str().unwrap_or_default();
         let address: Address = format!("0x{}", address.trim_start_matches("0x"))
             .parse()
             .context("Wallet address is missing")?;
-        return Ok(json!({"exists":true,"address":address}));
+        return Ok(json!({"exists":true,"address":address,"needsMigration":false}));
     }
     if action == "archive" {
         ensure!(
@@ -79,7 +83,18 @@ pub fn execute(directory: &Path, mut command: Value) -> Result<Value> {
     if action == "import" || action == "recovery" {
         ensure!(!path.exists(), "A wallet is already stored here");
         let signer = if action == "import" {
-            wallet::unlock(Path::new(&file), password.clone())?
+            let source = Path::new(&file);
+            let mut input = Vec::new();
+            fs::File::open(source)?
+                .take(1_048_577)
+                .read_to_end(&mut input)?;
+            ensure!(input.len() <= 1_048_576, "Wallet file is too large");
+            let value: Value = serde_json::from_slice(&input)?;
+            if wallet_migration::recognizes(&value) {
+                wallet_migration::unlock(source, &password)?
+            } else {
+                wallet::unlock(source, password.clone())?
+            }
         } else if file == "private_key" {
             let key = Zeroizing::new(
                 hex::decode(extra.trim().trim_start_matches("0x"))
@@ -104,9 +119,29 @@ pub fn execute(directory: &Path, mut command: Value) -> Result<Value> {
         wallet::store(&path, &signer, local_password, false)?;
         return Ok(json!({"address":signer.address(),"backupRequired":action!="import"}));
     }
-    let signer = wallet::unlock(&path, password.clone())?;
+    ensure!(
+        matches!(
+            action.as_str(),
+            "unlock" | "authorize" | "acknowledge" | "reveal" | "password" | "backup" | "remove"
+        ),
+        "Choose a supported wallet action"
+    );
+    let mut input = Vec::new();
+    fs::File::open(&path)?
+        .take(1_048_577)
+        .read_to_end(&mut input)?;
+    ensure!(input.len() <= 1_048_576, "Wallet file is too large");
+    let value: Value = serde_json::from_slice(&input)?;
+    let migrated = wallet_migration::recognizes(&value);
+    let signer = if migrated {
+        wallet_migration::migrate(&path, &password)?
+    } else {
+        wallet::unlock(&path, password.clone())?
+    };
     match action.as_str() {
-        "unlock" | "authorize" | "acknowledge" => Ok(json!({"address":signer.address()})),
+        "unlock" | "authorize" | "acknowledge" => {
+            Ok(json!({"address":signer.address(),"migrated":migrated}))
+        }
         "reveal" => {
             let key = Zeroizing::new(signer.to_bytes().0);
             Ok(json!({"kind":"private_key","secret":format!("0x{}",hex::encode(key.as_ref()))}))

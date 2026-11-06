@@ -1,5 +1,16 @@
 [
   {
+    "name": "aead",
+    "version": "0.5.2",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits",
+    "notices": [
+      "dependencies/aead-0.5.2/LICENSE-APACHE",
+      "dependencies/aead-0.5.2/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "aes",
     "version": "0.8.4",
     "license": "MIT OR Apache-2.0",
@@ -597,6 +608,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "argon2",
+    "version": "0.5.3",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/password-hashes/tree/master/argon2",
+    "notices": [
+      "dependencies/argon2-0.5.3/LICENSE-APACHE",
+      "dependencies/argon2-0.5.3/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "ark-ff",
     "version": "0.3.0",
     "license": "MIT/Apache-2.0",
@@ -1033,6 +1055,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "blake2",
+    "version": "0.10.6",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/hashes",
+    "notices": [
+      "dependencies/blake2-0.10.6/LICENSE-APACHE",
+      "dependencies/blake2-0.10.6/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "block-buffer",
     "version": "0.10.4",
     "license": "MIT OR Apache-2.0",
@@ -1177,12 +1210,34 @@
   },
   {
     "name": "chacha20",
+    "version": "0.9.1",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/stream-ciphers",
+    "notices": [
+      "dependencies/chacha20-0.9.1/LICENSE-APACHE",
+      "dependencies/chacha20-0.9.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "chacha20",
     "version": "0.10.2",
     "license": "MIT OR Apache-2.0",
     "repository": "https://github.com/RustCrypto/stream-ciphers",
     "notices": [
       "dependencies/chacha20-0.10.2/LICENSE-APACHE",
       "dependencies/chacha20-0.10.2/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "chacha20poly1305",
+    "version": "0.10.1",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305",
+    "notices": [
+      "dependencies/chacha20poly1305-0.10.1/LICENSE-APACHE",
+      "dependencies/chacha20poly1305-0.10.1/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },
@@ -2709,6 +2764,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "opaque-debug",
+    "version": "0.3.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "dependencies/opaque-debug-0.3.1/LICENSE-APACHE",
+      "dependencies/opaque-debug-0.3.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "parity-scale-codec",
     "version": "3.7.5",
     "license": "Apache-2.0",
@@ -2732,6 +2798,17 @@
         "source": "https://raw.githubusercontent.com/paritytech/parity-scale-codec/085b1ba8ba2fd4fcd3922afed07a034c1cb885d0/LICENSE"
       }
     ]
+  },
+  {
+    "name": "password-hash",
+    "version": "0.5.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits/tree/master/password-hash",
+    "notices": [
+      "dependencies/password-hash-0.5.0/LICENSE-APACHE",
+      "dependencies/password-hash-0.5.0/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
   },
   {
     "name": "paste",
@@ -2829,6 +2906,17 @@
     "notices": [
       "dependencies/pkg-config-0.3.34/LICENSE-APACHE",
       "dependencies/pkg-config-0.3.34/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "poly1305",
+    "version": "0.8.0",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/universal-hashes",
+    "notices": [
+      "dependencies/poly1305-0.8.0/LICENSE-APACHE",
+      "dependencies/poly1305-0.8.0/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },
@@ -4207,6 +4295,17 @@
     "notices": [
       "dependencies/unicode-xid-0.2.6/LICENSE-APACHE",
       "dependencies/unicode-xid-0.2.6/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "universal-hash",
+    "version": "0.5.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits",
+    "notices": [
+      "dependencies/universal-hash-0.5.1/LICENSE-APACHE",
+      "dependencies/universal-hash-0.5.1/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },

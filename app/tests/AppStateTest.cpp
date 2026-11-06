@@ -1,6 +1,7 @@
 #include "AppState.h"
 #include <QApplication>
 #include <QFile>
+#include <QJSEngine>
 #include <QJsonDocument>
 #include <QQmlApplicationEngine>
 #include <QQuickItem>
@@ -40,6 +41,21 @@ class AppStateTest final : public QObject {
     }
   private slots:
     void secure_download_transport_is_available() { QVERIFY(QSslSocket::supportsSsl()); }
+    void financial_strings_have_one_grouping_separator() {
+        QFile file(":/Zoru/app/qml/Palette.js");
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QString script = QString::fromUtf8(file.readAll()).replace(".pragma library", "");
+        QJSEngine engine;
+        const auto initialized = engine.evaluate(script);
+        QVERIFY2(!initialized.isError(), qPrintable(initialized.toString()));
+        const auto format = engine.globalObject().property("amountSummary");
+        QVERIFY(format.isCallable());
+        QCOMPARE(format.call({QJSValue("21170"), QJSValue(8)}).toString(), QString("21,170"));
+        QCOMPARE(format.call({QJSValue("21145"), QJSValue(8)}).toString(), QString("21,145"));
+        QCOMPARE(
+            format.call({QJSValue("123456789012345678901234567890"), QJSValue(8)}).toString(),
+            QString("123,456,789,012,345,678,901,234,567,890"));
+    }
     void global_contract_snapshot_preserves_financial_precision() {
         QTemporaryDir directory;
         AppState state(directory.path(), false);

@@ -47,6 +47,11 @@ def main():
             if not (target / 'bin' / binary).is_file():
                 raise ValueError(f'Missing binary: {binary}')
             (bindir / binary).symlink_to('/opt/zoru-miner/bin/' + binary)
+        # Existing desktop shortcuts can still reference the original GUI name.
+        (bindir / 'zoru-miner').symlink_to('/opt/zoru-miner/bin/zoru-miner-gui')
+        cleanup = bindir / 'zoru-clean-launchers'
+        shutil.copy2(ROOT / 'packaging/cleanup_launchers.py', cleanup)
+        cleanup.chmod(0o755)
         desktop = stage / 'usr/share/applications/zoru-miner.desktop'
         desktop.parent.mkdir(parents=True)
         desktop.write_text(

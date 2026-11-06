@@ -10,5 +10,6 @@ pub mod storage;
 pub mod stress;
 pub mod wallet;
 pub mod wallet_ipc;
+mod wallet_migration;
 
 pub mod release;

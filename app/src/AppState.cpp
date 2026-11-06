@@ -676,7 +676,9 @@ void AppState::completed(const QString &action, const QJsonObject &result) {
         // verified connection unless the account being observed actually changed.
         if (addressChanged)
             startMonitor();
-        message = action == "create"   ? "Wallet created. Save an encrypted backup before mining."
+        message = data.value("migrated").toBool()
+                      ? "Wallet upgraded safely to Web3 v3. Original encrypted wallet archived."
+                  : action == "create"   ? "Wallet created. Save an encrypted backup before mining."
                   : action == "unlock" ? "Wallet unlocked."
                   : action == "acknowledge" ? "Recovery backup confirmed."
                                             : "Wallet ready.";
