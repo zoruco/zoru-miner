@@ -1,2 +1,2 @@
-d3199d6e15e13fa2f25efd813df87fa96b229d7698df5e23f7c1ee7466232289  ZORU-Miner-1.5.6-Linux-amd64.deb
-607d4c169be32793a25cc4fcf1cefb36af2f620213cc4d5296f274bd2a3ae59c  ZORU-Miner-1.5.6-Linux-x86_64.tar.gz
+4b26ef0f725bb8a4b53e3d601b452c490768a4e448436b59cb55740cf3ebdd42  ZORU-Miner-1.5.7-Linux-amd64.deb
+074ea1a985644068627a7f442cb39ca8c271eb21a9eeeb9d774077aca1c4c4ba  ZORU-Miner-1.5.7-Linux-x86_64.tar.gz
