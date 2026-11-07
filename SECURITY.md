@@ -8,7 +8,7 @@ Keep a signing wallet and its transaction journal on one machine. Local file loc
 
 ## Network and contracts
 
-The miner verifies VEX EVM chain ID **6736**, native network identity, the deployment manifest, contract bytecode and module implementations. Use trusted RPC endpoints and verify the manifest's publisher separately. A checksum verifies file integrity, **not publisher authenticity**.
+The miner verifies VEX EVM chain ID **6736**, the deployment manifest, contract bytecode and module implementations. If an optional native endpoint is supplied, its network identity is also checked. Normal mining requires only EVM RPC. Use trusted RPC endpoints and verify the manifest's publisher separately. A checksum verifies file integrity, **not publisher authenticity**.
 
 The ZORU Token owner can change the issuer, upgrade mining modules, and pause mining or claims. The lifetime supply cap remains enforced by the Token. The mining-only issuance policy depends on the owner's decisions.
 

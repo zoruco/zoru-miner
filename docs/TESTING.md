@@ -25,11 +25,21 @@ cargo test --release --locked --manifest-path miner/Cargo.toml --test recovery -
 cargo test --release --locked --manifest-path miner/Cargo.toml --test mining_limit -- --ignored --test-threads=1
 cargo test --release --locked --manifest-path miner/Cargo.toml --test claim_reorg -- --ignored --test-threads=1
 cargo test --release --locked --manifest-path miner/Cargo.toml --test automatic_claim -- --ignored --test-threads=1
+cargo test --release --locked --manifest-path miner/Cargo.toml --test continuous -- --ignored --test-threads=1
 ```
 
 These tests cover nonce recovery, duplicate-proof handling, receipt verification, accepted work, claim accounting, and reorganization behavior. Keep separate state directories and signing journals for every independent chain.
 
-The isolated native VEX suite uses manifest mode `testnet`, EVM chain 46736 and its expected native genesis. This mode cannot sign on mainnet. Production manifests require mode `mainnet`, EVM chain 6736 and the mainnet native identity. Native tests separately exercise real authenticated drand mining, two miners, automatic settlement, both maintenance pauses, restarts, delayed RPC calls, an HTTP outage and loss of an accepted submission response. Storage load tests with a permissive accounting engine are reported separately from Keccak mining throughput.
+The complete fixture runner builds the reviewed contract sources into a temporary artifact directory, starts its own loopback Anvil on chain 6736 and creates a disposable encrypted wallet. It uses the real Ledger, Keccak engine and coordinator with an explicitly isolated deterministic beacon. It never changes the protocol source checkout or connects to a public chain for writes:
+
+```sh
+python3 tests/support/isolated.py --contracts /path/to/zoru-pow \
+  --output /tmp/zoru-isolated-validation --terminal --gui-build ./build
+```
+
+Foundry and the matching Solidity compiler must be available. The runner compiles tests with one build job and waits for CPU headroom before signed mining checks. Production CPU and memory guards remain enabled; a resource pause does not establish continuous-hashing success. The output path must not already exist. Reports contain local receipts, measured hashes, queue depths, RPC counts and CPU time. The private fixture options and encrypted wallet remain inside the permission-restricted output directory. Do not publish its credentials. `--baseline` runs a 20-second transaction-free measurement using two workers and one CPU core.
+
+The continuous fixture delays proof and claim receipts, rolls the epoch while a receipt is outstanding, checks that hashes keep increasing, and interrupts then restores RPC service. It also freezes the EVM head until the work lease expires and checks recovery when blocks advance again. A real coordinator upgrade checks generation changes and resumption on new work. Phase reports preserve the actual snapshots and receipts when a continuous-mining assertion fails. A slow inspection response also forces history updates after the snapshot block was pinned, checking that personal totals remain unavailable rather than mixing proof heights. Each phase waits for CPU headroom; bounded recovery waits require measured hash progress rather than accepting a status label or treating resource pauses as success. A read-only rewards command is also checked while the signing wallet is locked; it must leave the nonce unchanged. `--terminal` tests guided/interrupted setup, saved settings, overrides, non-TTY logs, terminal resizing, scrolling and restoration after Q, SIGINT and SIGTERM. Long desktop integration runs can use `QTEST_FUNCTION_TIMEOUT=1200000` to allow resource pauses without weakening individual assertions. The GUI fixture stages its own binaries and manifest, mines and claims with the shared engine, exercises pause/resume/stop and verifies preservation of the encrypted wallet. No existing deployment manifest or user profile is replaced.
 
 ## Read-only network checks
 

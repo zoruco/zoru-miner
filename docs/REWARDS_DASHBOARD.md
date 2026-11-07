@@ -38,10 +38,10 @@ A wallet's history must be synchronized before personal totals can be treated as
 
 ```sh
 zoru-miner-cli rewards --manifest ./deployment.json \
-  --read "$EVM_RPC" --submit "$EVM_SUBMIT_RPC" \
-  --native "$VEX_NATIVE_RPC" --state-dir ./miner-state
+  --rpc https://vexascan.com/rpc --state-dir ./miner-state \
+  --account 0xYourPublicEvmAddress
 ```
 
-Add `--wallet ./wallet.json` for personal metrics; the CLI prompts for the keystore password. `rewards` only reads chain state; it does not submit a transaction.
+After `zoru-miner-cli setup`, use `zoru-miner-cli rewards` with saved settings. Alternatively, replace `--account` with `--wallet ./wallet.json` to authenticate the keystore address with its password. `rewards` and `inspect` never acquire a signing session or rebroadcast journals.
 
 The desktop displays **My mining rewards** and **Global ZORU network**. Its existing Claim action can broadcast transactions and consume VEX gas. Both clients use the confirmed mainnet manifest.
