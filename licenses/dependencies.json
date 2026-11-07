@@ -22,6 +22,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "allocator-api2",
+    "version": "0.2.21",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/zakarumych/allocator-api2",
+    "notices": [
+      "dependencies/allocator-api2-0.2.21/LICENSE-APACHE",
+      "dependencies/allocator-api2-0.2.21/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "alloy-consensus",
     "version": "2.5.0",
     "license": "MIT OR Apache-2.0",
@@ -608,6 +619,16 @@
     "upstreamNotices": []
   },
   {
+    "name": "approx",
+    "version": "0.5.1",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/brendanzab/approx",
+    "notices": [
+      "dependencies/approx-0.5.1/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "argon2",
     "version": "0.5.3",
     "license": "MIT OR Apache-2.0",
@@ -1136,6 +1157,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "by_address",
+    "version": "1.2.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/mbrubeck/by_address",
+    "notices": [
+      "dependencies/by_address-1.2.1/LICENSE-APACHE",
+      "dependencies/by_address-1.2.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "byte-slice-cast",
     "version": "1.2.3",
     "license": "MIT",
@@ -1173,6 +1205,16 @@
     "license": "Apache-2.0",
     "repository": null,
     "notices": [],
+    "upstreamNotices": []
+  },
+  {
+    "name": "castaway",
+    "version": "0.2.4",
+    "license": "MIT",
+    "repository": "https://github.com/sagebind/castaway",
+    "notices": [
+      "dependencies/castaway-0.2.4/LICENSE"
+    ],
     "upstreamNotices": []
   },
   {
@@ -1342,6 +1384,16 @@
     "upstreamNotices": []
   },
   {
+    "name": "compact_str",
+    "version": "0.9.1",
+    "license": "MIT",
+    "repository": "https://github.com/ParkMyCar/compact_str",
+    "notices": [
+      "dependencies/compact_str-0.9.1/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "const-hex",
     "version": "1.19.3",
     "license": "MIT OR Apache-2.0",
@@ -1446,6 +1498,16 @@
     "upstreamNotices": []
   },
   {
+    "name": "crossterm",
+    "version": "0.29.0",
+    "license": "MIT",
+    "repository": "https://github.com/crossterm-rs/crossterm",
+    "notices": [
+      "dependencies/crossterm-0.29.0/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "crunchy",
     "version": "0.2.4",
     "license": "MIT",
@@ -1521,6 +1583,16 @@
     "upstreamNotices": []
   },
   {
+    "name": "darling",
+    "version": "0.24.1",
+    "license": "MIT",
+    "repository": "https://github.com/TedDriggs/darling",
+    "notices": [
+      "dependencies/darling-0.24.1/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "darling_core",
     "version": "0.23.0",
     "license": "MIT",
@@ -1531,12 +1603,32 @@
     "upstreamNotices": []
   },
   {
+    "name": "darling_core",
+    "version": "0.24.1",
+    "license": "MIT",
+    "repository": "https://github.com/TedDriggs/darling",
+    "notices": [
+      "dependencies/darling_core-0.24.1/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "darling_macro",
     "version": "0.23.0",
     "license": "MIT",
     "repository": "https://github.com/TedDriggs/darling",
     "notices": [
       "dependencies/darling_macro-0.23.0/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "darling_macro",
+    "version": "0.24.1",
+    "license": "MIT",
+    "repository": "https://github.com/TedDriggs/darling",
+    "notices": [
+      "dependencies/darling_macro-0.24.1/LICENSE"
     ],
     "upstreamNotices": []
   },
@@ -1667,6 +1759,17 @@
     "notices": [
       "dependencies/displaydoc-0.2.7/LICENSE-APACHE",
       "dependencies/displaydoc-0.2.7/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "document-features",
+    "version": "0.2.12",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/slint-ui/document-features",
+    "notices": [
+      "dependencies/document-features-0.2.12/LICENSE-APACHE",
+      "dependencies/document-features-0.2.12/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },
@@ -2404,6 +2507,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "indoc",
+    "version": "2.0.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/dtolnay/indoc",
+    "notices": [
+      "dependencies/indoc-2.0.8/LICENSE-APACHE",
+      "dependencies/indoc-2.0.8/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "inout",
     "version": "0.1.4",
     "license": "MIT OR Apache-2.0",
@@ -2411,6 +2525,16 @@
     "notices": [
       "dependencies/inout-0.1.4/LICENSE-APACHE",
       "dependencies/inout-0.1.4/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "instability",
+    "version": "0.3.14",
+    "license": "MIT",
+    "repository": "https://github.com/ratatui/instability",
+    "notices": [
+      "dependencies/instability-0.3.14/LICENSE.md"
     ],
     "upstreamNotices": []
   },
@@ -2516,6 +2640,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "kasuari",
+    "version": "0.4.13",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/ratatui/kasuari",
+    "notices": [
+      "dependencies/kasuari-0.4.13/LICENSE-APACHE",
+      "dependencies/kasuari-0.4.13/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "keccak",
     "version": "0.1.6",
     "license": "Apache-2.0 OR MIT",
@@ -2599,6 +2734,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "line-clipping",
+    "version": "0.3.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/ratatui/line-clipping",
+    "notices": [
+      "dependencies/line-clipping-0.3.8/LICENSE-APACHE",
+      "dependencies/line-clipping-0.3.8/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "linux-raw-sys",
     "version": "0.12.1",
     "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
@@ -2621,6 +2767,28 @@
     "upstreamNotices": []
   },
   {
+    "name": "litrs",
+    "version": "1.0.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/LukasKalbertodt/litrs",
+    "notices": [
+      "dependencies/litrs-1.0.1/LICENSE-APACHE",
+      "dependencies/litrs-1.0.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "lock_api",
+    "version": "0.4.14",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Amanieu/parking_lot",
+    "notices": [
+      "dependencies/lock_api-0.4.14/LICENSE-APACHE",
+      "dependencies/lock_api-0.4.14/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "log",
     "version": "0.4.34",
     "license": "MIT OR Apache-2.0",
@@ -2628,6 +2796,16 @@
     "notices": [
       "dependencies/log-0.4.34/LICENSE-APACHE",
       "dependencies/log-0.4.34/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "lru",
+    "version": "0.18.5",
+    "license": "MIT",
+    "repository": "https://github.com/jeromefroe/lru-rs.git",
+    "notices": [
+      "dependencies/lru-0.18.5/LICENSE"
     ],
     "upstreamNotices": []
   },
@@ -2742,6 +2920,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "num_threads",
+    "version": "0.1.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/jhpratt/num_threads",
+    "notices": [
+      "dependencies/num_threads-0.1.8/LICENSE-Apache",
+      "dependencies/num_threads-0.1.8/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "nybbles",
     "version": "0.4.8",
     "license": "MIT OR Apache-2.0",
@@ -2775,6 +2964,39 @@
     "upstreamNotices": []
   },
   {
+    "name": "palette",
+    "version": "0.7.7",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Ogeon/palette",
+    "notices": [
+      "dependencies/palette-0.7.7/LICENSE-APACHE",
+      "dependencies/palette-0.7.7/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "palette_derive",
+    "version": "0.7.7",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Ogeon/palette",
+    "notices": [
+      "dependencies/palette_derive-0.7.7/LICENSE-APACHE",
+      "dependencies/palette_derive-0.7.7/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "palette_math",
+    "version": "0.7.7",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Ogeon/palette",
+    "notices": [
+      "dependencies/palette_math-0.7.7/LICENSE-APACHE",
+      "dependencies/palette_math-0.7.7/LICENSE_MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "parity-scale-codec",
     "version": "3.7.5",
     "license": "Apache-2.0",
@@ -2798,6 +3020,28 @@
         "source": "https://raw.githubusercontent.com/paritytech/parity-scale-codec/085b1ba8ba2fd4fcd3922afed07a034c1cb885d0/LICENSE"
       }
     ]
+  },
+  {
+    "name": "parking_lot",
+    "version": "0.12.5",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Amanieu/parking_lot",
+    "notices": [
+      "dependencies/parking_lot-0.12.5/LICENSE-APACHE",
+      "dependencies/parking_lot-0.12.5/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "parking_lot_core",
+    "version": "0.9.12",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Amanieu/parking_lot",
+    "notices": [
+      "dependencies/parking_lot_core-0.9.12/LICENSE-APACHE",
+      "dependencies/parking_lot_core-0.9.12/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
   },
   {
     "name": "password-hash",
@@ -2917,6 +3161,17 @@
     "notices": [
       "dependencies/poly1305-0.8.0/LICENSE-APACHE",
       "dependencies/poly1305-0.8.0/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "portable-atomic",
+    "version": "1.15.0",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/taiki-e/portable-atomic",
+    "notices": [
+      "dependencies/portable-atomic-1.15.0/LICENSE-APACHE",
+      "dependencies/portable-atomic-1.15.0/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },
@@ -3209,6 +3464,46 @@
     "notices": [
       "dependencies/rapidhash-4.5.1/LICENSE-APACHE",
       "dependencies/rapidhash-4.5.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "ratatui",
+    "version": "0.30.2",
+    "license": "MIT",
+    "repository": "https://github.com/ratatui/ratatui",
+    "notices": [
+      "dependencies/ratatui-0.30.2/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "ratatui-core",
+    "version": "0.1.2",
+    "license": "MIT",
+    "repository": "https://github.com/ratatui/ratatui",
+    "notices": [
+      "dependencies/ratatui-core-0.1.2/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "ratatui-crossterm",
+    "version": "0.1.2",
+    "license": "MIT",
+    "repository": "https://github.com/ratatui/ratatui",
+    "notices": [
+      "dependencies/ratatui-crossterm-0.1.2/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "ratatui-widgets",
+    "version": "0.3.2",
+    "license": "MIT",
+    "repository": "https://github.com/ratatui/ratatui",
+    "notices": [
+      "dependencies/ratatui-widgets-0.3.2/LICENSE"
     ],
     "upstreamNotices": []
   },
@@ -3519,6 +3814,17 @@
     "upstreamNotices": []
   },
   {
+    "name": "scopeguard",
+    "version": "1.2.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/bluss/scopeguard",
+    "notices": [
+      "dependencies/scopeguard-1.2.0/LICENSE-APACHE",
+      "dependencies/scopeguard-1.2.0/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "scrypt",
     "version": "0.10.0",
     "license": "MIT OR Apache-2.0",
@@ -3761,6 +4067,39 @@
     "upstreamNotices": []
   },
   {
+    "name": "signal-hook",
+    "version": "0.3.18",
+    "license": "Apache-2.0/MIT",
+    "repository": "https://github.com/vorner/signal-hook",
+    "notices": [
+      "dependencies/signal-hook-0.3.18/LICENSE-APACHE",
+      "dependencies/signal-hook-0.3.18/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "signal-hook-mio",
+    "version": "0.2.5",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/vorner/signal-hook",
+    "notices": [
+      "dependencies/signal-hook-mio-0.2.5/LICENSE-APACHE",
+      "dependencies/signal-hook-mio-0.2.5/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "signal-hook-registry",
+    "version": "1.4.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/vorner/signal-hook",
+    "notices": [
+      "dependencies/signal-hook-registry-1.4.8/LICENSE-APACHE",
+      "dependencies/signal-hook-registry-1.4.8/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
     "name": "signature",
     "version": "2.2.0",
     "license": "Apache-2.0 OR MIT",
@@ -3854,6 +4193,26 @@
     "repository": "https://github.com/rapidfuzz/strsim-rs",
     "notices": [
       "dependencies/strsim-0.11.1/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "strum",
+    "version": "0.28.0",
+    "license": "MIT",
+    "repository": "https://github.com/Peternator7/strum",
+    "notices": [
+      "dependencies/strum-0.28.0/LICENSE"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "strum_macros",
+    "version": "0.28.0",
+    "license": "MIT",
+    "repository": "https://github.com/Peternator7/strum",
+    "notices": [
+      "dependencies/strum_macros-0.28.0/LICENSE"
     ],
     "upstreamNotices": []
   },
@@ -4284,6 +4643,28 @@
     "notices": [
       "dependencies/unicode-segmentation-1.13.3/LICENSE-APACHE",
       "dependencies/unicode-segmentation-1.13.3/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "unicode-truncate",
+    "version": "2.0.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/Aetf/unicode-truncate",
+    "notices": [
+      "dependencies/unicode-truncate-2.0.1/LICENSE-APACHE",
+      "dependencies/unicode-truncate-2.0.1/LICENSE-MIT"
+    ],
+    "upstreamNotices": []
+  },
+  {
+    "name": "unicode-width",
+    "version": "0.2.3",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/unicode-rs/unicode-width",
+    "notices": [
+      "dependencies/unicode-width-0.2.3/LICENSE-APACHE",
+      "dependencies/unicode-width-0.2.3/LICENSE-MIT"
     ],
     "upstreamNotices": []
   },

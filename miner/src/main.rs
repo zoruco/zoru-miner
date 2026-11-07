@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -14,6 +14,7 @@ use std::{
     thread,
 };
 use zeroize::Zeroizing;
+mod dashboard;
 use zoru_miner::{
     abi,
     pow::{self, Work},
@@ -57,7 +58,7 @@ struct Connection {
     /// Read one password line from stdin instead of prompting.
     #[arg(long)]
     password_stdin: bool,
-    /// Optional expected signer address, checked natively before any signing.
+    /// Optional expected signer address, checked before journal recovery or signing.
     #[arg(long)]
     expected_wallet: Option<Address>,
     /// Maximum total gas fees for this session, in wei.
@@ -68,6 +69,11 @@ struct Connection {
     account: Option<Address>,
 }
 impl Connection {
+    fn complete(&self) -> bool {
+        self.manifest.is_some()
+            && self.state_dir.is_some()
+            && (self.rpc.is_some() || (self.read.is_some() && self.submit.is_some()))
+    }
     fn options(&self) -> Options {
         Options {
             manifest: self.manifest.clone().expect("resolved manifest"),
@@ -94,16 +100,7 @@ impl Connection {
 #[derive(Subcommand)]
 enum Command {
     /// Save a trusted mainnet deployment, RPC and encrypted wallet path for future runs.
-    Setup {
-        #[arg(long)]
-        manifest: PathBuf,
-        #[arg(long)]
-        rpc: String,
-        #[arg(long)]
-        wallet: PathBuf,
-        #[arg(long)]
-        state_dir: PathBuf,
-    },
+    Setup(Setup),
     /// Verify the network, contract suite and balances.
     Inspect(Connection),
     /// Show personal and global rewards, including pending and unclaimed ZORU.
@@ -117,11 +114,11 @@ enum Command {
         #[command(flatten)]
         connection: Connection,
         /// Hashing threads: 1, 2 or 4.
-        #[arg(long, default_value_t = 1)]
-        workers: usize,
+        #[arg(long)]
+        workers: Option<usize>,
         /// Aggregate CPU budget in cores, greater than 0 and at most 2.
-        #[arg(long, default_value_t = 0.5)]
-        cpu_budget: f64,
+        #[arg(long)]
+        cpu_budget: Option<f64>,
         /// Stop after this many seconds; 0 runs until interrupted.
         #[arg(long, default_value_t = 0)]
         seconds: u64,
@@ -129,8 +126,14 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max_accepted: u64,
         /// Claim eligible rewards after this many accepted proofs; 0 disables it.
-        #[arg(long, default_value_t = 50)]
-        auto_claim_after: u64,
+        #[arg(long)]
+        auto_claim_after: Option<u64>,
+        /// Emit JSON events instead of the interactive terminal dashboard.
+        #[arg(long)]
+        plain: bool,
+        /// Use ASCII borders and status text in the terminal dashboard.
+        #[arg(long)]
+        ascii: bool,
         /// Run the real mining loop without signing or broadcasting transactions.
         #[arg(long, requires = "account")]
         dry_run: bool,
@@ -180,6 +183,25 @@ enum Command {
         nonce: String,
     },
 }
+
+#[derive(Args)]
+struct Setup {
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long)]
+    rpc: Option<String>,
+    #[arg(long)]
+    wallet: Option<PathBuf>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    workers: Option<usize>,
+    #[arg(long)]
+    cpu_budget: Option<f64>,
+    /// Accepted unclaimed proofs before automatic settlement; 0 disables it.
+    #[arg(long)]
+    auto_claim_after: Option<u64>,
+}
 fn wire(value: Value) -> Value {
     match value {
         Value::Number(ref number) if number.as_u64().is_some_and(|v| v > 9_007_199_254_740_991) => {
@@ -215,11 +237,12 @@ fn connect(
     connection: &Connection,
     password: Zeroizing<String>,
     sync_history: bool,
+    observer: zoru_miner::Emit,
 ) -> Result<Arc<Session>> {
     let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut options = connection.options();
         options.sync_on_connect = sync_history;
-        Session::connect(options, password, Arc::new(emit))
+        Session::connect(options, password, observer)
     }))
     .unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
@@ -274,7 +297,7 @@ fn serve(connection: Connection) -> Result<()> {
         if let Some(handle) = active.take() {
             let _ = handle.join();
         }
-        if matches!(action.as_str(), "mine" | "claim")
+        if matches!(action.as_str(), "mine" | "claim" | "inspect")
             && let Some(session) = holder.lock().unwrap().as_ref()
         {
             session.begin_action();
@@ -291,7 +314,7 @@ fn serve(connection: Connection) -> Result<()> {
                     } else {
                         Zeroizing::new(String::new())
                     };
-                    let session = connect(&connection, secret, false)?;
+                    let session = connect(&connection, secret, false, Arc::new(emit))?;
                     session.inspect()?;
                     *holder.lock().unwrap() = Some(session);
                     return Ok(());
@@ -304,8 +327,14 @@ fn serve(connection: Connection) -> Result<()> {
                 match action.as_str() {
                     "mine" => {
                         let result = session.run(Run {
-                            workers: command["workers"].as_u64().unwrap_or(1) as usize,
-                            cpu_budget: command["cpuBudget"].as_f64().unwrap_or(0.5),
+                            workers: usize::try_from(
+                                command["workers"]
+                                    .as_u64()
+                                    .unwrap_or(default_workers() as u64),
+                            )?,
+                            cpu_budget: command["cpuBudget"]
+                                .as_f64()
+                                .unwrap_or(default_cpu_budget()),
                             seconds: command["seconds"].as_u64().unwrap_or(0),
                             max_accepted: command["maxAccepted"].as_u64().unwrap_or(0),
                             auto_claim_after: 0,
@@ -354,30 +383,101 @@ struct SavedConnection {
     rpc: String,
     wallet: PathBuf,
     state_dir: PathBuf,
+    #[serde(default = "default_workers")]
+    workers: usize,
+    #[serde(default = "default_cpu_budget")]
+    cpu_budget: f64,
+    #[serde(default = "default_auto_claim")]
+    auto_claim_after: u64,
+}
+fn default_workers() -> usize {
+    Run::default().workers
+}
+fn default_cpu_budget() -> f64 {
+    Run::default().cpu_budget
+}
+fn default_auto_claim() -> u64 {
+    Run::default().auto_claim_after
 }
 
 fn config_path() -> Result<PathBuf> {
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(base).join("zoru-miner").join("config.json"));
+    #[cfg(windows)]
+    {
+        return Ok(PathBuf::from(
+            std::env::var_os("APPDATA").context("Cannot locate APPDATA for miner configuration")?,
+        )
+        .join("ZORU/config.json"));
     }
-    if let Some(base) = std::env::var_os("APPDATA") {
-        return Ok(PathBuf::from(base).join("ZORU").join("config.json"));
+    #[cfg(not(windows))]
+    {
+        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            ensure!(
+                Path::new(&base).is_absolute(),
+                "XDG_CONFIG_HOME must be an absolute path"
+            );
+            return Ok(PathBuf::from(base).join("zoru-miner/config.json"));
+        }
+        let home = std::env::var_os("HOME")
+            .context("Cannot locate home directory for miner configuration")?;
+        Ok(PathBuf::from(home).join(".config/zoru-miner/config.json"))
     }
-    let home =
-        std::env::var_os("HOME").context("Cannot locate home directory for miner configuration")?;
-    Ok(PathBuf::from(home).join(".config/zoru-miner/config.json"))
+}
+
+fn load_config(path: &Path) -> Result<Option<SavedConnection>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Cannot read saved miner configuration"),
+    };
+    let mut bytes = Vec::new();
+    file.take(16385).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 16384,
+        "Saved miner configuration is too large"
+    );
+    let config: SavedConnection = serde_json::from_slice(&bytes)
+        .context("Invalid saved configuration; review config.json or restore its backup")?;
+    Ok(Some(config))
+}
+
+fn mining_options(
+    workers: Option<usize>,
+    cpu_budget: Option<f64>,
+    auto_claim_after: Option<u64>,
+    saved: Option<&SavedConnection>,
+) -> Run {
+    Run {
+        workers: workers
+            .or_else(|| saved.map(|s| s.workers))
+            .unwrap_or(default_workers()),
+        cpu_budget: cpu_budget
+            .or_else(|| saved.map(|s| s.cpu_budget))
+            .unwrap_or(default_cpu_budget()),
+        auto_claim_after: auto_claim_after
+            .or_else(|| saved.map(|s| s.auto_claim_after))
+            .unwrap_or(default_auto_claim()),
+        ..Run::default()
+    }
 }
 
 fn save_config(path: &Path, config: &SavedConnection) -> Result<()> {
+    ensure!(
+        !path.exists(),
+        "Configuration already exists; back it up before replacing"
+    );
     ensure!(
         config.manifest.is_file(),
         "Deployment manifest does not exist"
     );
     ensure!(config.wallet.is_file(), "Encrypted wallet does not exist");
+    zoru_miner::protocol::Manifest::load(&config.manifest)
+        .context("Invalid deployment manifest")?;
+    wallet::validate(&config.wallet).context("Invalid encrypted wallet")?;
     zoru_miner::rpc::Rpc::new(&config.rpc, std::time::Duration::ZERO)?;
+    mining_options(None, None, None, Some(config)).validate()?;
     ensure!(
-        !path.exists(),
-        "Configuration already exists; back it up before replacing"
+        !config.state_dir.exists() || config.state_dir.is_dir(),
+        "State path must be a directory; existing data was preserved"
     );
     let parent = path.parent().context("Invalid configuration directory")?;
     fs::create_dir_all(parent)?;
@@ -386,72 +486,195 @@ fn save_config(path: &Path, config: &SavedConnection) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    let state_dir = if config.state_dir.is_absolute() {
-        config.state_dir.clone()
-    } else {
-        std::env::current_dir()?.join(&config.state_dir)
-    };
     let config = SavedConnection {
         manifest: fs::canonicalize(&config.manifest)?,
         rpc: config.rpc.clone(),
         wallet: fs::canonicalize(&config.wallet)?,
-        state_dir,
+        state_dir: std::path::absolute(&config.state_dir)?,
+        workers: config.workers,
+        cpu_budget: config.cpu_budget,
+        auto_claim_after: config.auto_claim_after,
     };
-    zoru_miner::storage::atomic_json(path, &serde_json::to_value(config)?)?;
+    storage::create_json(path, &config)?;
     Ok(())
 }
 
-fn resolve_connection(mut connection: Connection) -> Result<Connection> {
-    let needs_config = connection.manifest.is_none()
-        || connection.state_dir.is_none()
-        || (connection.rpc.is_none() && connection.read.is_none());
-    if needs_config {
-        let path = config_path()?;
-        let config: SavedConnection =
-            serde_json::from_slice(&fs::read(&path).with_context(|| {
-                format!(
-                    "Missing connection settings; run zoru-miner-cli setup (config: {})",
-                    path.display()
-                )
-            })?)?;
-        connection.manifest.get_or_insert(config.manifest);
-        connection.state_dir.get_or_insert(config.state_dir);
+fn resolve_with_config(
+    mut connection: Connection,
+    config: Option<&SavedConnection>,
+) -> Result<Connection> {
+    if let Some(config) = config {
+        connection
+            .manifest
+            .get_or_insert_with(|| config.manifest.clone());
+        connection
+            .state_dir
+            .get_or_insert_with(|| config.state_dir.clone());
         if connection.rpc.is_none() && connection.read.is_none() && connection.submit.is_none() {
-            connection.rpc = Some(config.rpc);
+            connection.rpc = Some(config.rpc.clone());
         }
         if connection.wallet.is_none() && connection.account.is_none() {
-            connection.wallet = Some(config.wallet);
+            connection.wallet = Some(config.wallet.clone());
         }
     }
     ensure!(
         connection.manifest.is_some() && connection.state_dir.is_some(),
-        "Manifest and state directory are required"
+        "Missing connection settings; run zoru-miner-cli setup"
     );
     ensure!(
         connection.rpc.is_some() || (connection.read.is_some() && connection.submit.is_some()),
-        "Provide --rpc or both --read and --submit"
+        "Provide --rpc or both --read and --submit, or run zoru-miner-cli setup"
     );
     Ok(connection)
 }
 
+fn resolve_connection(connection: Connection) -> Result<Connection> {
+    // The desktop passes a complete connection and retains its own UI preferences.
+    if connection.complete() {
+        return resolve_with_config(connection, None);
+    }
+    resolve_with_config(connection, load_config(&config_path()?)?.as_ref())
+}
+
+fn prompt(label: &str, default: Option<&str>) -> Result<String> {
+    ensure!(
+        io::stdin().is_terminal(),
+        "Missing {label}; supply setup flags when input is redirected"
+    );
+    match default {
+        Some(value) => eprint!("{label} [{value}]: "),
+        None => eprint!("{label}: "),
+    }
+    io::stderr().flush()?;
+    let mut value = String::new();
+    ensure!(
+        io::stdin().read_line(&mut value)? != 0,
+        "Setup interrupted; no configuration was saved"
+    );
+    let value = value.trim();
+    let value = if value.is_empty() {
+        default.unwrap_or_default()
+    } else {
+        value
+    };
+    ensure!(
+        !value.is_empty(),
+        "{label} is required; no configuration was saved"
+    );
+    Ok(value.to_owned())
+}
+
+fn setup(args: Setup) -> Result<()> {
+    let path = config_path()?;
+    ensure!(
+        !path.exists(),
+        "Configuration already exists; back it up before replacing"
+    );
+    let interactive = io::stdin().is_terminal();
+    let packaged = std::env::current_exe()?
+        .parent()
+        .and_then(Path::parent)
+        .map(|p| p.join("share/zoru-miner/deployment.json"));
+    let manifest = match args.manifest {
+        Some(value) => value,
+        None => PathBuf::from(prompt(
+            "Trusted deployment manifest",
+            packaged
+                .as_ref()
+                .filter(|p| p.is_file())
+                .and_then(|p| p.to_str()),
+        )?),
+    };
+    let wallet = match args.wallet {
+        Some(value) => value,
+        None => PathBuf::from(prompt("Existing encrypted wallet", None)?),
+    };
+    let rpc = match args.rpc {
+        Some(value) => value,
+        None if interactive => prompt("EVM RPC endpoint", Some("https://vexascan.com/rpc"))?,
+        None => "https://vexascan.com/rpc".to_owned(),
+    };
+    let state_dir = match args.state_dir {
+        Some(value) => value,
+        None => {
+            let default = storage::default_root()?.join("state");
+            if interactive {
+                PathBuf::from(prompt(
+                    "State directory (existing journals are retained)",
+                    default.to_str(),
+                )?)
+            } else {
+                default
+            }
+        }
+    };
+    let workers = match args.workers {
+        Some(value) => value,
+        None if interactive => prompt("Workers (1, 2 or 4)", Some(&default_workers().to_string()))?
+            .parse()
+            .context("Invalid worker count")?,
+        None => default_workers(),
+    };
+    let cpu_budget = match args.cpu_budget {
+        Some(value) => value,
+        None if interactive => prompt(
+            "CPU budget in cores (greater than 0, at most 2)",
+            Some(&default_cpu_budget().to_string()),
+        )?
+        .parse()
+        .context("Invalid CPU budget")?,
+        None => default_cpu_budget(),
+    };
+    let auto_claim_after = match args.auto_claim_after {
+        Some(value) => value,
+        None if interactive => {
+            prompt("Auto-claim after unclaimed proofs (0 disables)", Some("50"))?
+                .parse()
+                .context("Invalid auto-claim threshold")?
+        }
+        None => default_auto_claim(),
+    };
+    let config = SavedConnection {
+        manifest,
+        rpc,
+        wallet,
+        state_dir,
+        workers,
+        cpu_budget,
+        auto_claim_after,
+    };
+    mining_options(None, None, None, Some(&config)).validate()?;
+    ensure!(
+        config.wallet.is_file(),
+        "Encrypted wallet not found; choose the existing encrypted wallet"
+    );
+    ensure!(
+        config.manifest.is_file(),
+        "Trusted deployment manifest not found"
+    );
+    wallet::validate(&config.wallet).context("Invalid encrypted wallet")?;
+    let manifest = zoru_miner::protocol::Manifest::load(&config.manifest)
+        .context("Invalid deployment manifest")?;
+    let validation = tempfile::tempdir()?;
+    let client = zoru_miner::protocol::Client::new(
+        manifest,
+        &config.rpc,
+        &config.rpc,
+        None,
+        validation.path().join("journal"),
+        validation.path().join("receipts"),
+    )?;
+    client
+        .verify()
+        .context("Setup connection verification failed; no configuration was saved")?;
+    save_config(&path, &config)?;
+    emit(json!({"event":"configured","path":path}));
+    Ok(())
+}
+
 fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Setup {
-            manifest,
-            rpc,
-            wallet,
-            state_dir,
-        } => {
-            let config = SavedConnection {
-                manifest,
-                rpc,
-                wallet,
-                state_dir,
-            };
-            let path = config_path()?;
-            save_config(&path, &config)?;
-            emit(json!({"event":"configured","path":path}));
-        }
+        Command::Setup(args) => setup(args)?,
         Command::WalletManage { directory } => {
             let mut input = Zeroizing::new(String::new());
             io::stdin().take(16_385).read_to_string(&mut input)?;
@@ -513,10 +736,16 @@ fn run() -> Result<()> {
         }
         Command::Serve(connection) => serve(resolve_connection(connection)?)?,
         command => {
-            let (connection, mode, options) = match command {
-                Command::Inspect(c) => (c, "inspect", None),
-                Command::Rewards(c) => (c, "rewards", None),
-                Command::Claim(c) => (c, "claim", None),
+            let saved = match &command {
+                Command::Inspect(c) | Command::Rewards(c) | Command::Claim(c) if c.complete() => {
+                    None
+                }
+                _ => load_config(&config_path()?)?,
+            };
+            let (connection, mode, options, plain, ascii) = match command {
+                Command::Inspect(c) => (c, "inspect", None, true, false),
+                Command::Rewards(c) => (c, "rewards", None, true, false),
+                Command::Claim(c) => (c, "claim", None, true, false),
                 Command::Mine {
                     connection,
                     workers,
@@ -524,28 +753,60 @@ fn run() -> Result<()> {
                     seconds,
                     max_accepted,
                     auto_claim_after,
+                    plain,
+                    ascii,
                     dry_run,
                 } => (
                     connection,
                     "mine",
                     Some(Run {
-                        workers,
-                        cpu_budget,
                         seconds,
                         max_accepted,
-                        auto_claim_after: if dry_run { 0 } else { auto_claim_after },
                         dry_run,
+                        ..mining_options(
+                            workers,
+                            cpu_budget,
+                            if dry_run { Some(0) } else { auto_claim_after },
+                            saved.as_ref(),
+                        )
                     }),
+                    plain,
+                    ascii,
                 ),
                 _ => unreachable!(),
             };
-            let connection = resolve_connection(connection)?;
-            let secret = if connection.wallet.is_some() {
+            let mut connection = resolve_with_config(connection, saved.as_ref())?;
+            if let Some(options) = &options {
+                options.validate()?;
+            }
+            let interactive = dashboard::available(plain);
+            let view = Arc::new(Mutex::new(dashboard::View::default()));
+            let display = view.clone();
+            let observer: zoru_miner::Emit = if interactive {
+                Arc::new(move |value| display.lock().unwrap().receive(value))
+            } else {
+                Arc::new(emit)
+            };
+            let mut secret = if connection.wallet.is_some() {
                 password(connection.password_stdin)?
             } else {
                 Zeroizing::new(String::new())
             };
-            let session = connect(&connection, secret, true)?;
+            // Read-only commands can authenticate a keystore's public address,
+            // but must never open signing state or replay a transaction journal.
+            if matches!(mode, "inspect" | "rewards")
+                && connection.account.is_none()
+                && let Some(path) = &connection.wallet
+            {
+                ensure!(
+                    path.is_file(),
+                    "Encrypted wallet not found; review setup or --wallet"
+                );
+                connection.account = Some(wallet::unlock(path, secret)?.address());
+                connection.wallet = None;
+                secret = Zeroizing::new(String::new());
+            }
+            let session = connect(&connection, secret, true, observer)?;
             session.begin_action();
             let stop = session.stop.clone();
             ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
@@ -555,7 +816,34 @@ fn run() -> Result<()> {
                 }
                 "claim" => emit(json!({"event":"claims","data":session.settle()?})),
                 _ => {
-                    let result = session.run(options.unwrap())?;
+                    let result = if interactive {
+                        let locale = std::env::var("LC_ALL")
+                            .or_else(|_| std::env::var("LC_CTYPE"))
+                            .or_else(|_| std::env::var("LANG"))
+                            .unwrap_or_default();
+                        let engine = session.clone();
+                        let options = options.unwrap();
+                        let mining = thread::spawn(move || engine.run(options));
+                        let rendering = dashboard::run(
+                            &session,
+                            &mining,
+                            view,
+                            ascii || matches!(locale.as_str(), "C" | "POSIX"),
+                        );
+                        if rendering.is_err() {
+                            session.stop.store(true, Ordering::SeqCst);
+                        }
+                        let result = mining.join().map_err(|_| {
+                            anyhow::anyhow!("Mining thread failed; signed journals are retained")
+                        })?;
+                        rendering?;
+                        result?
+                    } else {
+                        session.run(options.unwrap())?
+                    };
+                    if interactive {
+                        emit(json!({"event":"mine-result","data":result}));
+                    }
                     ensure!(
                         result["runOutcome"] != "failed",
                         "Mining failed without an accepted proof"
@@ -578,6 +866,37 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture(directory: &Path) -> SavedConnection {
+        use sha2::Digest;
+        let mut manifest = json!({
+            "schema":"zoru-mainnet-suite-1","chainId":6736,"mode":"local",
+            "token":Address::repeat_byte(1),"ledger":Address::repeat_byte(2),
+            "engine":Address::repeat_byte(3),"beacon":Address::repeat_byte(4),
+            "admin":Address::repeat_byte(5),"owner":Address::repeat_byte(6),
+            "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
+            "drandChainHash":zoru_miner::protocol::DRAND_HASH,
+            "runtimeCodeHashes":{},"approvedImplementationCodeHashes":{}
+        });
+        manifest["manifestSha256"] = json!(hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&manifest).unwrap()
+        )));
+        let config = SavedConnection {
+            manifest: directory.join("deployment.json"),
+            rpc: "https://vexascan.com/rpc".into(),
+            wallet: directory.join("wallet.json"),
+            state_dir: directory.join("state"),
+            workers: 2,
+            cpu_budget: 1.0,
+            auto_claim_after: 0,
+        };
+        fs::write(&config.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(
+            &config.wallet,
+            include_bytes!("../tests/fixtures/pbkdf2-v3.json"),
+        )
+        .unwrap();
+        config
+    }
     #[test]
     fn accepts_single_evm_rpc() {
         let cli = Cli::try_parse_from([
@@ -639,6 +958,9 @@ mod tests {
             rpc: "https://vexascan.com/rpc".into(),
             wallet: dir.path().join("missing-wallet.json"),
             state_dir: dir.path().join("state"),
+            workers: default_workers(),
+            cpu_budget: default_cpu_budget(),
+            auto_claim_after: default_auto_claim(),
         };
         assert!(save_config(&dir.path().join("config.json"), &config).is_err());
         assert!(!dir.path().join("config.json").exists());
@@ -647,23 +969,104 @@ mod tests {
     #[test]
     fn setup_persists_only_paths_and_rpc_and_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = dir.path().join("deployment.json");
-        let wallet = dir.path().join("wallet.json");
-        fs::write(&manifest, "{}").unwrap();
-        fs::write(&wallet, "{}").unwrap();
         let path = dir.path().join("config.json");
-        let config = SavedConnection {
-            manifest: manifest.clone(),
-            rpc: "https://vexascan.com/rpc".into(),
-            wallet: wallet.clone(),
-            state_dir: dir.path().join("state"),
-        };
+        let config = fixture(dir.path());
         save_config(&path, &config).unwrap();
         let saved: SavedConnection = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved.manifest, manifest);
-        assert_eq!(saved.wallet, wallet);
+        assert_eq!(saved.manifest, config.manifest);
+        assert_eq!(saved.wallet, config.wallet);
         assert_eq!(saved.rpc, config.rpc);
         assert!(save_config(&path, &config).is_err());
+        let content = fs::read_to_string(path).unwrap();
+        assert!(!content.contains("password") && !content.contains("private"));
+        assert_eq!(saved.workers, 2);
+        assert_eq!(saved.cpu_budget, 1.0);
+        assert_eq!(saved.auto_claim_after, 0);
+    }
+
+    #[test]
+    fn cli_overrides_saved_preferences_then_uses_safe_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = fixture(dir.path());
+        let defaults = mining_options(None, None, None, None);
+        assert_eq!(
+            (
+                defaults.workers,
+                defaults.cpu_budget,
+                defaults.auto_claim_after
+            ),
+            (1, 0.5, 50)
+        );
+        let preferences = mining_options(None, None, None, Some(&saved));
+        assert_eq!(
+            (
+                preferences.workers,
+                preferences.cpu_budget,
+                preferences.auto_claim_after
+            ),
+            (2, 1.0, 0)
+        );
+        let overridden = mining_options(Some(4), Some(2.0), Some(10), Some(&saved));
+        assert_eq!(
+            (
+                overridden.workers,
+                overridden.cpu_budget,
+                overridden.auto_claim_after
+            ),
+            (4, 2.0, 10)
+        );
+        let Command::Mine { connection, .. } =
+            Cli::try_parse_from(["zoru-miner-cli", "mine", "--rpc", "https://example.com/rpc"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        let resolved = resolve_with_config(connection, Some(&saved)).unwrap();
+        assert_eq!(resolved.options().read, "https://example.com/rpc");
+        assert_eq!(resolved.wallet, Some(saved.wallet));
+    }
+
+    #[test]
+    fn old_path_only_configuration_gets_defaults_and_invalid_configuration_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = fixture(dir.path());
+        let path = dir.path().join("config.json");
+        fs::write(&path, json!({"manifest":saved.manifest,"wallet":saved.wallet,"rpc":saved.rpc,"state_dir":saved.state_dir}).to_string()).unwrap();
+        assert_eq!(
+            load_config(&path).unwrap().unwrap().workers,
+            default_workers()
+        );
+        fs::write(&path, "{unfinished").unwrap();
+        assert!(load_config(&path).is_err());
+        let mut config = fixture(dir.path());
+        config.cpu_budget = f64::NAN;
+        assert!(save_config(&dir.path().join("new.json"), &config).is_err());
+        config.cpu_budget = 1.0;
+        fs::write(&config.manifest, "{}").unwrap();
+        assert!(save_config(&dir.path().join("new.json"), &config).is_err());
+        assert!(!dir.path().join("new.json").exists());
+    }
+
+    #[test]
+    fn explicit_options_can_repair_invalid_saved_mining_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saved = fixture(dir.path());
+        saved.workers = 8;
+        saved.cpu_budget = 3.0;
+        let path = dir.path().join("config.json");
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let loaded = load_config(&path).unwrap().unwrap();
+        assert!(
+            mining_options(None, None, None, Some(&loaded))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            mining_options(Some(2), Some(1.0), None, Some(&loaded))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
