@@ -34,12 +34,15 @@ struct Connection {
     /// Trusted deployment manifest with reviewed contract fingerprints.
     #[arg(long)]
     manifest: PathBuf,
-    /// HTTPS or loopback EVM endpoint for chain reads.
-    #[arg(long)]
-    read: String,
-    /// HTTPS or loopback endpoint for signed transaction submission.
-    #[arg(long)]
-    submit: String,
+    /// One EVM RPC endpoint for reads and signed transaction submission.
+    #[arg(long, conflicts_with_all = ["read", "submit"])]
+    rpc: Option<String>,
+    /// Optional separate EVM read endpoint.
+    #[arg(long, requires = "submit")]
+    read: Option<String>,
+    /// Optional separate EVM transaction endpoint.
+    #[arg(long, requires = "read")]
+    submit: Option<String>,
     /// Native Vexanium endpoint used to verify network identity and health.
     #[arg(long)]
     native: String,
@@ -66,8 +69,16 @@ impl Connection {
     fn options(&self) -> Options {
         Options {
             manifest: self.manifest.clone(),
-            read: self.read.clone(),
-            submit: self.submit.clone(),
+            read: self
+                .rpc
+                .clone()
+                .or_else(|| self.read.clone())
+                .expect("validated EVM RPC"),
+            submit: self
+                .rpc
+                .clone()
+                .or_else(|| self.submit.clone())
+                .expect("validated EVM RPC"),
             native: self.native.clone(),
             wallet: self.wallet.clone(),
             expected_wallet: self.expected_wallet,
@@ -206,6 +217,10 @@ fn connect(
 }
 
 fn serve(connection: Connection) -> Result<()> {
+    ensure!(
+        connection.rpc.is_some() || (connection.read.is_some() && connection.submit.is_some()),
+        "Provide --rpc or both --read and --submit"
+    );
     let holder: Arc<Mutex<Option<Arc<Session>>>> = Arc::new(Mutex::new(None));
     let busy = Arc::new(AtomicBool::new(false));
     let mut active: Option<thread::JoinHandle<()>> = None;
@@ -408,6 +423,11 @@ fn run() -> Result<()> {
                 ),
                 _ => unreachable!(),
             };
+            ensure!(
+                connection.rpc.is_some()
+                    || (connection.read.is_some() && connection.submit.is_some()),
+                "Provide --rpc or both --read and --submit"
+            );
             let secret = if connection.wallet.is_some() {
                 password(connection.password_stdin)?
             } else {
@@ -446,6 +466,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_single_evm_rpc() {
+        let cli = Cli::try_parse_from([
+            "zoru-miner-cli",
+            "mine",
+            "--manifest",
+            "deployment.json",
+            "--rpc",
+            "https://vexascan.com/rpc",
+            "--native",
+            "https://vexascan.com:8443",
+            "--state-dir",
+            "state",
+        ])
+        .unwrap();
+        let Command::Mine { connection, .. } = cli.command else {
+            panic!("expected mine")
+        };
+        assert_eq!(connection.options().read, "https://vexascan.com/rpc");
+        assert_eq!(connection.options().submit, "https://vexascan.com/rpc");
+    }
+
+    #[test]
+    fn rejects_ambiguous_rpc_flags() {
+        assert!(
+            Cli::try_parse_from([
+                "zoru-miner-cli",
+                "mine",
+                "--manifest",
+                "deployment.json",
+                "--rpc",
+                "https://vexascan.com/rpc",
+                "--read",
+                "http://127.0.0.1:18546",
+                "--native",
+                "https://vexascan.com:8443",
+                "--state-dir",
+                "state",
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn exact_uint256_wire_format() {
         assert_eq!(

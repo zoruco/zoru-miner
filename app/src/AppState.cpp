@@ -335,8 +335,8 @@ QString AppState::statePath() const {
     return QDir(m_storage).filePath("chain-state");
 }
 QStringList AppState::connectionArguments() const {
-    return {"--manifest",  manifestPath(), "--read",   m_rpcUrl,
-            "--submit",    m_rpcUrl,       "--native", "https://vexascan.com:8443",
+    return {"--manifest", manifestPath(), "--rpc", m_rpcUrl,
+            "--native", "https://vexascan.com:8443",
             "--state-dir", statePath()};
 }
 void AppState::loadWallet() {
