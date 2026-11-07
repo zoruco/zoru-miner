@@ -178,6 +178,8 @@ impl Rpc {
                 ": native RAM capacity is exhausted"
             } else if message.contains("min_inclusion_price") {
                 ": gas price is below the relay inclusion minimum"
+            } else if message.contains("transaction net usage is too high") {
+                ": native relay transaction NET limit exceeded"
             } else if message.contains("max_transaction_cpu_usage") {
                 ": native execution CPU limit exceeded"
             } else {
@@ -327,6 +329,10 @@ pub(crate) mod tests {
             (
                 "assertion failure with message: inclusion price must >= min_inclusion_price",
                 "gas price is below the relay inclusion minimum",
+            ),
+            (
+                "transaction net usage is too high: 304 > 118",
+                "native relay transaction NET limit exceeded",
             ),
         ] {
             let (rpc, server) = serve_response(

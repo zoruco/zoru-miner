@@ -1200,6 +1200,11 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
         emit miningChanged();
         return;
     }
+    if (type == "warning") {
+        if (!m_stopRequested)
+            announce(event.value("warning").toString(), false);
+        return;
+    }
     if (type == "error") {
         if (m_stopRequested)
             return;

@@ -551,11 +551,8 @@ pub fn run(
         }
     }
     let _restore = Restore;
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        previous(info);
-    }));
+    // try_init installs Ratatui's panic restoration hook. The guard covers
+    // normal return and rendering/input errors.
     (|| -> Result<()> {
         while !mining.is_finished() {
             terminal.draw(|frame| {

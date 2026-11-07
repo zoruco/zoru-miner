@@ -102,6 +102,9 @@ class AppStateTest final : public QObject {
             QCOMPARE(state.candidateQueueDepth(), 4);
             QCOMPARE(state.pendingTransactions(), 1);
         }
+        state.applyMinerEvent({{"event", "warning"}, {"warning", "Submission response unavailable; tracking retained transaction"}});
+        QVERIFY(state.activelyHashing());
+        QCOMPARE(state.transactionStatus(), QString("Tracking receipt"));
         state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{{"status", "rpc-degraded"}}}});
         QVERIFY(!state.activelyHashing());
         QCOMPARE(state.miningStatus(), QString("RPC degraded"));

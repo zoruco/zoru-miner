@@ -1063,9 +1063,7 @@ impl Client {
             self.identity()?;
             verify_evm_chain(&self.submit, self.manifest.chain_id)?;
             ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
-            let broadcast = self
-                .submit
-                .request("eth_sendRawTransaction", json!([entry.raw]));
+            let broadcast = self.broadcast(&entry);
             let receipt = match self.receipt(entry.hash, Duration::from_secs(35)) {
                 Ok(receipt) => receipt,
                 Err(receipt_error) => return Err(broadcast.err().unwrap_or(receipt_error)),
@@ -1098,6 +1096,22 @@ impl Client {
                 "idle"
             });
         }
+        result
+    }
+    fn broadcast(&self, record: &Journal) -> Result<Value> {
+        self.transaction_phase("tx-submission", &record.label, Some(record.hash));
+        let result = self
+            .submit
+            .request("eth_sendRawTransaction", json!([record.raw]));
+        if let Err(error) = &result
+            && let Some(emit) = self.observer.lock().unwrap().clone()
+        {
+            let detail: String = error.to_string().chars().take(350).collect();
+            emit(
+                json!({"event":"warning","warning":format!("Submission response: {detail}; tracking retained transaction {:#x}",record.hash)}),
+            );
+        }
+        self.transaction_phase("receipt-tracking", &record.label, Some(record.hash));
         result
     }
     fn transaction_phase(&self, status: &str, label: &str, hash: Option<B256>) {
@@ -1281,11 +1295,7 @@ impl Client {
                     );
                 }
             }
-            self.transaction_phase("tx-submission", label, Some(hash));
-            let broadcast = self
-                .submit
-                .request("eth_sendRawTransaction", json!([record.raw]));
-            self.transaction_phase("receipt-tracking", label, Some(hash));
+            let broadcast = self.broadcast(&record);
             match self.receipt(hash, Duration::from_secs(35)) {
                 Ok(value) => {
                     result = Some(value);

@@ -388,9 +388,6 @@ impl Session {
         if result.account != Address::ZERO && options.sync_on_connect {
             result.stats.lock().unwrap()["status"] = json!("syncing-history");
             result.publish()?;
-            if result.signer.is_none() {
-                result.inspect()?;
-            }
             result.sync_history()?;
             result.stats.lock().unwrap()["status"] = json!("connected");
         }

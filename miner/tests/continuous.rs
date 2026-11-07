@@ -49,6 +49,53 @@ fn progressed(states: &[Value], label: &str) -> bool {
     hashes.len() >= 2 && hashes.last() > hashes.first()
 }
 
+fn generation_progressed(states: &[Value], generation: &str) -> bool {
+    let hashes: Vec<u64> = states
+        .iter()
+        .filter(|s| {
+            s["status"] == "mining"
+                && s["contexts"]
+                    .as_array()
+                    .and_then(|contexts| contexts.last())
+                    .is_some_and(|work| work["generation"] == generation)
+        })
+        .filter_map(|s| s["hashes"].as_u64())
+        .collect();
+    hashes.len() >= 2 && hashes.last() > hashes.first()
+}
+
+fn resumed_after_thaw(states: &[Value]) -> bool {
+    let hashes: Vec<u64> = states
+        .iter()
+        .filter(|s| s["status"] == "mining" && s["elapsedSeconds"].as_f64().unwrap_or(0.0) >= 8.0)
+        .filter_map(|s| s["hashes"].as_u64())
+        .collect();
+    hashes.len() >= 2 && hashes.last() > hashes.first()
+}
+
+fn wait_for_headroom() {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let cpus = thread::available_parallelism().map_or(1, usize::from) as f64;
+    let mut calm_since = Instant::now();
+    loop {
+        let load = fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        });
+        if zoru_miner::session::resource_blocked() || load.is_some_and(|n| n >= cpus * 0.8) {
+            calm_since = Instant::now();
+        } else if calm_since.elapsed() >= Duration::from_secs(5) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Insufficient resource headroom for concurrency evidence; production guards remain enabled"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 #[test]
 #[ignore = "requires an isolated Anvil deployment and disposable encrypted wallet"]
 fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() {
@@ -75,12 +122,16 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     let tx_hash = Arc::new(Mutex::new(None::<B256>));
     let submitted = tx_hash.clone();
     let controls = control.clone();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = PathBuf::from(cfg["report"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .join("continuous-state");
+    fs::create_dir_all(&directory).unwrap();
     let session = Session::connect(Options {
         manifest:PathBuf::from(cfg["manifest"].as_str().unwrap()),
         read:cfg["faultRead"].as_str().unwrap().into(), submit:cfg["submit"].as_str().unwrap().into(),native:None,
         wallet:Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),expected_wallet:None,observer:None,
-        fee_budget:None,sync_on_connect:true,state_dir:directory.path().into(),
+        fee_budget:None,sync_on_connect:true,state_dir:directory.clone(),
     },Zeroizing::new(cfg["password"].as_str().unwrap().into()),Arc::new(move |event| {
         if event["event"]=="state" {
             let mut states = observed.lock().unwrap();
@@ -111,7 +162,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         .arg("--wallet")
         .arg(cfg["wallet"].as_str().unwrap())
         .arg("--state-dir")
-        .arg(directory.path().join("reader"))
+        .arg(directory.join("reader"))
         .arg("--password-stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -130,12 +181,31 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         "{}",
         String::from_utf8_lossy(&inspected.stdout)
     );
-    assert!(String::from_utf8_lossy(&inspected.stdout).contains("\"event\":\"inspection\""));
+    let snapshots = String::from_utf8_lossy(&inspected.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["event"] == "inspection")
+        .count();
+    assert_eq!(
+        snapshots, 1,
+        "A read-only command must fetch its snapshot once"
+    );
     assert_eq!(
         session.client.nonce(session.account, "latest").unwrap(),
         before
     );
+    let record = |phase: &str, result: &Value| {
+        storage::atomic_json(
+            &directory.join(format!("phase-{phase}.json")),
+            &json!({
+                "result":result,"states":*states.lock().unwrap(),
+                "transactions":*session.client.transactions.lock().unwrap()
+            }),
+        )
+        .unwrap();
+    };
     let launch = session.client.manifest.launch_time;
+    wait_for_headroom();
     next_epoch(&raw, launch);
     let chain = raw.clone();
     let rollover = thread::spawn(move || {
@@ -166,6 +236,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         })
         .unwrap();
     rollover.join().unwrap();
+    record("proof", &result);
     assert_eq!(result["accepted"], 2, "{result}");
     assert_eq!(result["rejected"], 0, "{result}");
     assert!(
@@ -181,6 +252,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         "old queued candidates must be discarded"
     );
     states.lock().unwrap().clear();
+    wait_for_headroom();
     next_epoch(&raw, launch);
     session.begin_action();
     let claims = session
@@ -192,12 +264,15 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
             ..Run::default()
         })
         .unwrap();
+    record("claim", &claims);
     assert!(claims["autoClaimed"].as_u64().unwrap_or(0) > 0, "{claims}");
     assert!(delayed_claim.load(Ordering::SeqCst));
     assert!(
         progressed(&states.lock().unwrap(), "claim"),
-        "hashing must continue during claim receipt tracking"
+        "hashing must continue during claim receipt tracking; inspect phase-claim.json; result: {claims}"
     );
+    wait_for_headroom();
+    next_epoch(&raw, launch);
     states.lock().unwrap().clear();
     storage::atomic_json(&control, &json!({"outage":true})).unwrap();
     let restored = control.clone();
@@ -217,6 +292,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         })
         .unwrap();
     restore.join().unwrap();
+    record("outage", &outage);
     assert_eq!(outage["rejected"], 0);
     let seen = states.lock().unwrap();
     assert!(seen.iter().any(|s| s["status"] == "rpc-degraded"));
@@ -229,6 +305,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
             .all(|s| s["candidateQueueDepth"].as_u64().unwrap_or(0) <= 64)
     );
     drop(seen);
+    wait_for_headroom();
     next_epoch(&raw, launch);
     states.lock().unwrap().clear();
     let frozen = raw
@@ -236,27 +313,40 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         .unwrap();
     storage::atomic_json(&control, &json!({"frozenBlock":frozen})).unwrap();
     let thawed = control.clone();
+    let thaw_states = states.clone();
+    let thaw_stop = session.stop.clone();
     let thaw = thread::spawn(move || {
         thread::sleep(Duration::from_secs(8));
         storage::atomic_json(&thawed, &json!({})).unwrap();
+        while !thaw_stop.load(Ordering::Relaxed) {
+            if resumed_after_thaw(&thaw_states.lock().unwrap()) {
+                thaw_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     });
     session.begin_action();
     let freeze = session
         .run(Run {
             workers: 1,
             cpu_budget: 0.1,
-            seconds: 13,
+            seconds: 90,
             dry_run: true,
             auto_claim_after: 0,
             ..Run::default()
         })
         .unwrap();
     thaw.join().unwrap();
+    record("frozen-head", &freeze);
     assert_eq!(freeze["rejected"], 0);
     let frozen_states = states.lock().unwrap();
     let waiting: Vec<_> = frozen_states
         .iter()
-        .filter(|s| s["status"] == "waiting-beacon-or-recovery")
+        .filter(|s| {
+            s["status"] == "waiting-beacon-or-recovery"
+                && (5.0..8.0).contains(&s["elapsedSeconds"].as_f64().unwrap_or(0.0))
+        })
         .collect();
     assert!(
         waiting.len() >= 2,
@@ -264,18 +354,16 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     );
     assert!(waiting.windows(2).any(|s| s[0]["hashes"] == s[1]["hashes"]));
     assert!(
-        frozen_states
-            .iter()
-            .rev()
-            .take(4)
-            .any(|s| s["status"] == "mining"),
-        "hashing must resume on an advancing head"
+        resumed_after_thaw(&frozen_states),
+        "hashes must increase on an advancing head; inspect phase-frozen-head.json; result: {freeze}"
     );
     drop(frozen_states);
+    wait_for_headroom();
     next_epoch(&raw, launch);
     states.lock().unwrap().clear();
     let upgrade_chain = raw.clone();
     let upgrade_states = states.clone();
+    let upgrade_stop = session.stop.clone();
     let engine = session.client.manifest.engine;
     let admin = session.client.manifest.admin;
     let owner = session.client.manifest.owner;
@@ -332,18 +420,29 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
             assert!(Instant::now() < deadline, "Isolated upgrade was not mined");
             thread::sleep(Duration::from_millis(100));
         }
+        // Give the production resource guard time to permit real work. Stop
+        // only after hashes advance on the verified new generation; a status
+        // label or a resource pause alone cannot satisfy this assertion.
+        while !upgrade_stop.load(Ordering::Relaxed) {
+            if generation_progressed(&upgrade_states.lock().unwrap(), "2") {
+                upgrade_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     });
     let upgrade = session
         .run(Run {
             workers: 1,
             cpu_budget: 0.1,
-            seconds: 20,
+            seconds: 90,
             dry_run: true,
             auto_claim_after: 0,
             ..Run::default()
         })
         .unwrap();
     upgrading.join().unwrap();
+    record("upgrade", &upgrade);
     assert!(
         upgrade["contexts"]
             .as_array()
@@ -355,14 +454,8 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     assert_eq!(upgrade["rejected"], 0);
     assert!(upgrade["hashes"].as_u64().unwrap() > 0);
     assert!(
-        states
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .take(4)
-            .any(|s| s["status"] == "mining"),
-        "hashing must resume after upgrade verification"
+        generation_progressed(&states.lock().unwrap(), "2"),
+        "hashes must increase after upgrade verification; inspect phase-upgrade.json; result: {upgrade}"
     );
     session.begin_action();
     session.client.reconcile(session.account, true).unwrap();
