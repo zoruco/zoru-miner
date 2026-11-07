@@ -1,10 +1,12 @@
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs,
     io::{self, BufRead, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -33,7 +35,7 @@ struct Cli {
 struct Connection {
     /// Trusted deployment manifest with reviewed contract fingerprints.
     #[arg(long)]
-    manifest: PathBuf,
+    manifest: Option<PathBuf>,
     /// One EVM RPC endpoint for reads and signed transaction submission.
     #[arg(long, conflicts_with_all = ["read", "submit"])]
     rpc: Option<String>,
@@ -51,7 +53,7 @@ struct Connection {
     wallet: Option<PathBuf>,
     /// Directory for proof history and receipts; retain it between runs.
     #[arg(long)]
-    state_dir: PathBuf,
+    state_dir: Option<PathBuf>,
     /// Read one password line from stdin instead of prompting.
     #[arg(long)]
     password_stdin: bool,
@@ -68,7 +70,7 @@ struct Connection {
 impl Connection {
     fn options(&self) -> Options {
         Options {
-            manifest: self.manifest.clone(),
+            manifest: self.manifest.clone().expect("resolved manifest"),
             read: self
                 .rpc
                 .clone()
@@ -85,12 +87,23 @@ impl Connection {
             fee_budget: self.session_budget_wei,
             observer: self.account,
             sync_on_connect: true,
-            state_dir: self.state_dir.clone(),
+            state_dir: self.state_dir.clone().expect("resolved state directory"),
         }
     }
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Save a trusted mainnet deployment, RPC and encrypted wallet path for future runs.
+    Setup {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        rpc: String,
+        #[arg(long)]
+        wallet: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Verify the network, contract suite and balances.
     Inspect(Connection),
     /// Show personal and global rewards, including pending and unclaimed ZORU.
@@ -334,8 +347,111 @@ fn serve(connection: Connection) -> Result<()> {
     }
     Ok(())
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedConnection {
+    manifest: PathBuf,
+    rpc: String,
+    wallet: PathBuf,
+    state_dir: PathBuf,
+}
+
+fn config_path() -> Result<PathBuf> {
+    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(base).join("zoru-miner").join("config.json"));
+    }
+    if let Some(base) = std::env::var_os("APPDATA") {
+        return Ok(PathBuf::from(base).join("ZORU").join("config.json"));
+    }
+    let home =
+        std::env::var_os("HOME").context("Cannot locate home directory for miner configuration")?;
+    Ok(PathBuf::from(home).join(".config/zoru-miner/config.json"))
+}
+
+fn save_config(path: &Path, config: &SavedConnection) -> Result<()> {
+    ensure!(
+        config.manifest.is_file(),
+        "Deployment manifest does not exist"
+    );
+    ensure!(config.wallet.is_file(), "Encrypted wallet does not exist");
+    zoru_miner::rpc::Rpc::new(&config.rpc, std::time::Duration::ZERO)?;
+    ensure!(
+        !path.exists(),
+        "Configuration already exists; back it up before replacing"
+    );
+    let parent = path.parent().context("Invalid configuration directory")?;
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let state_dir = if config.state_dir.is_absolute() {
+        config.state_dir.clone()
+    } else {
+        std::env::current_dir()?.join(&config.state_dir)
+    };
+    let config = SavedConnection {
+        manifest: fs::canonicalize(&config.manifest)?,
+        rpc: config.rpc.clone(),
+        wallet: fs::canonicalize(&config.wallet)?,
+        state_dir,
+    };
+    zoru_miner::storage::atomic_json(path, &serde_json::to_value(config)?)?;
+    Ok(())
+}
+
+fn resolve_connection(mut connection: Connection) -> Result<Connection> {
+    let needs_config = connection.manifest.is_none()
+        || connection.state_dir.is_none()
+        || (connection.rpc.is_none() && connection.read.is_none());
+    if needs_config {
+        let path = config_path()?;
+        let config: SavedConnection =
+            serde_json::from_slice(&fs::read(&path).with_context(|| {
+                format!(
+                    "Missing connection settings; run zoru-miner-cli setup (config: {})",
+                    path.display()
+                )
+            })?)?;
+        connection.manifest.get_or_insert(config.manifest);
+        connection.state_dir.get_or_insert(config.state_dir);
+        if connection.rpc.is_none() && connection.read.is_none() && connection.submit.is_none() {
+            connection.rpc = Some(config.rpc);
+        }
+        if connection.wallet.is_none() && connection.account.is_none() {
+            connection.wallet = Some(config.wallet);
+        }
+    }
+    ensure!(
+        connection.manifest.is_some() && connection.state_dir.is_some(),
+        "Manifest and state directory are required"
+    );
+    ensure!(
+        connection.rpc.is_some() || (connection.read.is_some() && connection.submit.is_some()),
+        "Provide --rpc or both --read and --submit"
+    );
+    Ok(connection)
+}
+
 fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Setup {
+            manifest,
+            rpc,
+            wallet,
+            state_dir,
+        } => {
+            let config = SavedConnection {
+                manifest,
+                rpc,
+                wallet,
+                state_dir,
+            };
+            let path = config_path()?;
+            save_config(&path, &config)?;
+            emit(json!({"event":"configured","path":path}));
+        }
         Command::WalletManage { directory } => {
             let mut input = Zeroizing::new(String::new());
             io::stdin().take(16_385).read_to_string(&mut input)?;
@@ -395,7 +511,7 @@ fn run() -> Result<()> {
                 pow::digest(&work, beneficiary, abi::quantity(&nonce)?)
             );
         }
-        Command::Serve(connection) => serve(connection)?,
+        Command::Serve(connection) => serve(resolve_connection(connection)?)?,
         command => {
             let (connection, mode, options) = match command {
                 Command::Inspect(c) => (c, "inspect", None),
@@ -423,11 +539,7 @@ fn run() -> Result<()> {
                 ),
                 _ => unreachable!(),
             };
-            ensure!(
-                connection.rpc.is_some()
-                    || (connection.read.is_some() && connection.submit.is_some()),
-                "Provide --rpc or both --read and --submit"
-            );
+            let connection = resolve_connection(connection)?;
             let secret = if connection.wallet.is_some() {
                 password(connection.password_stdin)?
             } else {
@@ -506,6 +618,52 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn mine_without_flags_parses_and_requires_saved_setup() {
+        let cli = Cli::try_parse_from(["zoru-miner-cli", "mine"]).unwrap();
+        let Command::Mine { connection, .. } = cli.command else {
+            panic!("expected mine")
+        };
+        assert!(connection.manifest.is_none());
+        assert!(connection.state_dir.is_none());
+        assert!(connection.rpc.is_none());
+    }
+
+    #[test]
+    fn setup_rejects_missing_wallet_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SavedConnection {
+            manifest: dir.path().join("missing-manifest.json"),
+            rpc: "https://vexascan.com/rpc".into(),
+            wallet: dir.path().join("missing-wallet.json"),
+            state_dir: dir.path().join("state"),
+        };
+        assert!(save_config(&dir.path().join("config.json"), &config).is_err());
+        assert!(!dir.path().join("config.json").exists());
+    }
+
+    #[test]
+    fn setup_persists_only_paths_and_rpc_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("deployment.json");
+        let wallet = dir.path().join("wallet.json");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(&wallet, "{}").unwrap();
+        let path = dir.path().join("config.json");
+        let config = SavedConnection {
+            manifest: manifest.clone(),
+            rpc: "https://vexascan.com/rpc".into(),
+            wallet: wallet.clone(),
+            state_dir: dir.path().join("state"),
+        };
+        save_config(&path, &config).unwrap();
+        let saved: SavedConnection = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.manifest, manifest);
+        assert_eq!(saved.wallet, wallet);
+        assert_eq!(saved.rpc, config.rpc);
+        assert!(save_config(&path, &config).is_err());
     }
 
     #[test]
