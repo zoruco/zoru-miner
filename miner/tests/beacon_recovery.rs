@@ -113,7 +113,7 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
         manifest.clone(),
         &format!("{endpoint}/read"),
         &format!("{endpoint}/submit"),
-        "http://127.0.0.1:1",
+        Some("http://127.0.0.1:1"),
         dir.path().join("journal"),
         dir.path().join("receipts"),
     )
@@ -123,7 +123,7 @@ fn obsolete_beacons_recover_and_reused_nonce_archives_preserve_both_hashes() {
         manifest,
         &format!("{endpoint}/read"),
         &format!("{endpoint}/wrong-chain"),
-        "http://127.0.0.1:1",
+        Some("http://127.0.0.1:1"),
         dir.path().join("wrong-journal"),
         dir.path().join("wrong-receipts"),
     )

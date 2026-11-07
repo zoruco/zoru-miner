@@ -33,7 +33,6 @@ Use an encrypted Web3 version 3 wallet and the manifest included with the releas
 zoru-miner-cli mine \
   --manifest ./share/zoru-miner/deployment.json \
   --rpc https://vexascan.com/rpc \
-  --native https://vexascan.com:8443 \
   --wallet ./wallet.json --state-dir ./state \
   --workers 2 --cpu-budget 1 --auto-claim-after 50
 ```

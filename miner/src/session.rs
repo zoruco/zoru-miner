@@ -32,7 +32,7 @@ pub struct Options {
     pub manifest: PathBuf,
     pub read: String,
     pub submit: String,
-    pub native: String,
+    pub native: Option<String>,
     pub wallet: Option<PathBuf>,
     pub expected_wallet: Option<Address>,
     pub observer: Option<Address>,
@@ -263,7 +263,7 @@ impl Session {
             manifest,
             &options.read,
             &options.submit,
-            &options.native,
+            options.native.as_deref(),
             journal,
             options.state_dir.join("receipts"),
         )?;
@@ -928,7 +928,11 @@ impl Session {
         let cpu_begin = process_cpu();
         let requests_begin = self.client.read.request_count()
             + self.client.submit.request_count()
-            + self.client.native.request_count();
+            + self
+                .client
+                .native
+                .as_ref()
+                .map_or(0, |rpc| rpc.request_count());
         let hashes = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
@@ -1235,7 +1239,11 @@ impl Session {
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
         let requests = self.client.read.request_count()
             + self.client.submit.request_count()
-            + self.client.native.request_count()
+            + self
+                .client
+                .native
+                .as_ref()
+                .map_or(0, |rpc| rpc.request_count())
             - requests_begin;
         data["rpcRequests"] = json!(requests);
         data["rpcRequestsPerAcceptedProof"] = match data["accepted"].as_u64() {

@@ -17,7 +17,7 @@ fn accepted_proof_limit_stops_the_transaction_writer() {
             manifest: PathBuf::from(cfg["manifest"].as_str().unwrap()),
             read: cfg["read"].as_str().unwrap().into(),
             submit: cfg["submit"].as_str().unwrap().into(),
-            native: "http://127.0.0.1:1".into(),
+            native: Some("http://127.0.0.1:1".into()),
             wallet: Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),
             expected_wallet: None,
             fee_budget: None,
