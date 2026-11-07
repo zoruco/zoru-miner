@@ -22,7 +22,7 @@ Set **Maximum per session (VEX)** and save the allowance. This covers all transa
 
 ## Mine
 
-Select **Start Mining**, enter the wallet password and review the fee authorization. The app searches for valid proofs and submits them to the contract.
+Select **Start Mining**, enter the wallet password and review the fee authorization. Hashing continues while proofs are submitted and receipts are tracked. **Transactions** shows this progress separately from hashing, including pending transactions and queued candidates. Balances, rewards and contract totals refresh through the same Rust session.
 
 An accepted proof is eligible for a share of its epoch's budget. Its reward can change while other proofs are being accepted into that epoch. The application does not count an accepted proof as a paid reward.
 

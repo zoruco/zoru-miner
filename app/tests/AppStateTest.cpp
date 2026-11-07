@@ -86,6 +86,30 @@ class AppStateTest final : public QObject {
         QCOMPARE(state.confirmedProofs(), qulonglong(0));
         QCOMPARE(state.confirmedRewards(), QString("—"));
     }
+    void transactions_and_claims_do_not_hide_active_hashing() {
+        QTemporaryDir directory;
+        AppState state(directory.path(), false);
+        state.m_running = true;
+        state.m_sessionAuthorized = true;
+        for (const auto &label : {"mined-proof", "claim", "seal"}) {
+            state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{
+                {"status", "mining"}, {"hashesPerSecond", 12345},
+                {"candidateQueueDepth", 4}, {"pendingTransactions", 1},
+                {"transactionPipeline", QJsonObject{{"status", "receipt-tracking"}, {"label", label}, {"pending", 1}}}}}});
+            QVERIFY(state.activelyHashing());
+            QCOMPARE(state.miningStatus(), QString("Mining"));
+            QCOMPARE(state.transactionStatus(), QString("Tracking receipt"));
+            QCOMPARE(state.candidateQueueDepth(), 4);
+            QCOMPARE(state.pendingTransactions(), 1);
+        }
+        state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{{"status", "rpc-degraded"}}}});
+        QVERIFY(!state.activelyHashing());
+        QCOMPARE(state.miningStatus(), QString("RPC degraded"));
+        state.m_journalPending = true;
+        QVERIFY(state.pendingTransaction());
+        state.m_journalPending = false;
+        QVERIFY(!state.pendingTransaction());
+    }
     void framed_output_accepts_large_bursts_and_rejects_oversized_frames() {
         QTemporaryDir directory;
         AppState state(directory.path(), false);
@@ -252,6 +276,66 @@ class AppStateTest final : public QObject {
             QVERIFY(window->grabWindow().save(
                 QDir(profile).filePath("screenshots/" + page.toLower() + ".png")));
         }
+    }
+    void isolated_mining_and_claims_use_the_shared_backend() {
+        const auto options = qEnvironmentVariable("ZORU_ISOLATED_UI_OPTIONS");
+        if (options.isEmpty())
+            QSKIP("Requires disposable isolated EVM fixture options");
+        QFile file(options);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto config = QJsonDocument::fromJson(file.readAll()).object();
+        const QUrl rpc(config.value("read").toString());
+        QCOMPARE(rpc.scheme(), QString("http"));
+        QCOMPARE(rpc.host(), QString("127.0.0.1"));
+        QFile manifest(config.value("manifest").toString());
+        QVERIFY(manifest.open(QIODevice::ReadOnly));
+        QCOMPARE(QJsonDocument::fromJson(manifest.readAll()).object().value("mode").toString(), QString("local"));
+        QTemporaryDir profile;
+        const auto target = QDir(profile.path()).filePath("mining-wallet.json");
+        QFile original(config.value("wallet").toString());
+        QVERIFY(original.open(QIODevice::ReadOnly));
+        const auto encrypted = original.readAll();
+        QVERIFY(QFile::copy(original.fileName(), target));
+        AppState state(profile.path(), false);
+        state.m_enableNetwork = true;
+        state.m_rpcUrl = rpc.toString();
+        state.m_rpcUrls = {rpc.toString()};
+        state.m_backupConfirmed = true;
+        state.m_preferences->setValue("wallet/backup/" + state.address().toLower(), true);
+        state.setSessionBudget("1");
+        state.setCpuThreads(2);
+        state.setIntensity(25);
+        state.startMonitor();
+        QTRY_VERIFY_WITH_TIMEOUT(state.networkHealthy(), 60000);
+        QVERIFY2(state.miningBlocker().isEmpty(), qPrintable(state.miningBlocker()));
+        QVERIFY(state.startMining(config.value("password").toString(), true));
+        QTRY_VERIFY_WITH_TIMEOUT(state.activelyHashing(), 60000);
+        QCOMPARE(state.m_monitor.state(), QProcess::NotRunning);
+        QTRY_VERIFY_WITH_TIMEOUT(state.pendingTransactions() > 0 && state.activelyHashing(), 90000);
+        QTRY_VERIFY_WITH_TIMEOUT(state.sessionAccepted() >= 2, 120000);
+        state.pauseMining();
+        QTRY_VERIFY_WITH_TIMEOUT(state.m_engineHolds.contains("manual"), 10000);
+        QVERIFY(!state.activelyHashing());
+        state.resumeMining();
+        QTRY_VERIFY_WITH_TIMEOUT(state.activelyHashing(), 15000);
+        state.stopMining();
+        QTRY_VERIFY_WITH_TIMEOUT(!state.mining(), 30000);
+        QCOMPARE(state.sessionRejected(), 0);
+        QVERIFY(!state.signingAuthorized());
+        QCOMPARE(QProcess::execute("cast", {"rpc", "--rpc-url", rpc.toString(), "evm_increaseTime", "61"}), 0);
+        QCOMPARE(QProcess::execute("cast", {"rpc", "--rpc-url", rpc.toString(), "evm_mine"}), 0);
+        state.startMonitor();
+        QTRY_VERIFY_WITH_TIMEOUT(state.m_historyComplete && !state.proofs().isEmpty(), 60000);
+        QVERIFY(state.claimRewards(config.value("password").toString(), true));
+        QTRY_VERIFY_WITH_TIMEOUT(state.mining(), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(!state.mining(), 120000);
+        state.startMonitor();
+        QTRY_VERIFY_WITH_TIMEOUT(state.confirmedRewards() != "—" && state.confirmedRewards() != "0", 60000);
+        QFile preserved(target);
+        QVERIFY(preserved.open(QIODevice::ReadOnly));
+        QCOMPARE(preserved.readAll(), encrypted);
+        QVERIFY(!state.signingAuthorized());
+        QVERIFY(state.m_preferences->value("wallet/backup/" + state.address().toLower()).toBool());
     }
     void every_page_loads_with_current_contract_data() {
         QTemporaryDir directory;

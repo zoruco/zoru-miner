@@ -748,6 +748,8 @@ void AppState::clearWalletProjection() {
     m_unlocked = false;
     m_backupConfirmed = false;
     m_damaged = false;
+    m_journalPending = false;
+    m_pendingTransactions = 0;
     m_nativeBalance = m_tokenBalance = m_confirmedRewards = m_myPending = m_myUnclaimed = "—";
     m_confirmedProofs = 0;
     m_proofs.clear();
@@ -761,21 +763,7 @@ void AppState::clearWalletProjection() {
     emit networkChanged();
 }
 bool AppState::pendingTransaction() const {
-    QString root = qEnvironmentVariable("ZORU_STATE_ROOT");
-    if (root.isEmpty())
-        root = QDir::home().filePath(".zoru");
-    const QDir journal(
-        QDir(root).filePath("signers/mainnet/" + m_address.toLower() + "/private-journal"));
-    for (const auto &name : journal.entryList({"*.json"}, QDir::Files)) {
-        QFile file(journal.filePath(name));
-        if (file.size() > 1024 * 1024 || !file.open(QIODevice::ReadOnly))
-            continue;
-        const auto state =
-            QJsonDocument::fromJson(file.readAll()).object().value("state").toString();
-        if (state != "confirmed" && state != "superseded")
-            return true;
-    }
-    return false;
+    return m_journalPending || m_pendingTransactions > 0;
 }
 QStringList AppState::miningHolds() const {
     if (!m_running)
@@ -808,8 +796,7 @@ QString AppState::miningExplanation() const {
         return "Claiming eligible proof rewards. Each claim uses a separate transaction.";
     if (activelyHashing())
         return "CPU hashing is active. Accepted proofs share their epoch's reward budget.";
-    return "Waiting for verified work or transaction confirmation. Rewards are claimed separately "
-           "from this interface.";
+    return "Waiting for current, validated mining work. Transactions are tracked independently.";
 }
 QString AppState::networkReadiness() const {
     return m_healthy ? "RPC connected · Chain verified" : m_network;
@@ -930,6 +917,10 @@ void AppState::launchMiner(QByteArray password) {
     m_miner.setArguments(arguments);
     m_running = true;
     m_miningStatus = "Verifying wallet and deployment";
+    m_transactionStatus = "Idle";
+    m_candidateQueueDepth = m_pendingTransactions = 0;
+    m_monitorRestart.stop();
+    stopProcess(m_monitor);
     m_miner.start();
     emit miningChanged();
     emit statsChanged();
@@ -1018,7 +1009,7 @@ void AppState::stopProcess(QProcess &process) {
     }
 }
 void AppState::startMonitor() {
-    if (!m_enableNetwork || m_closing || !m_engineAvailable)
+    if (!m_enableNetwork || m_closing || !m_engineAvailable || m_running)
         return;
     if (m_monitor.state() != QProcess::NotRunning) {
         m_monitorRestartPending = true;
@@ -1140,6 +1131,7 @@ void AppState::applyInspection(const QJsonObject &data) {
     if (isAddress(m_address) &&
         data.value("address").toString().compare(m_address, Qt::CaseInsensitive) == 0) {
         m_tokenBalance = tokens(data.value("tokenBalanceBaseUnits"));
+        m_journalPending = data.value("pendingJournals").toInt() > 0;
         m_nativeBalance = vexFromWei(data.value("nativeBalanceWei"));
         m_myPending = tokens(data.value("myPendingBaseUnits"));
         m_myUnclaimed = tokens(data.value("myUnclaimedBaseUnits"));
@@ -1176,6 +1168,7 @@ void AppState::applyInspection(const QJsonObject &data) {
     }
     emit networkChanged();
     emit historyChanged();
+    emit miningChanged();
 }
 void AppState::applyFees(const QJsonObject &fees) {
     m_sessionFeeLimit = vexFromWei(fees.value("limitWei"));
@@ -1184,6 +1177,14 @@ void AppState::applyFees(const QJsonObject &fees) {
     m_sessionFeesRemaining = vexFromWei(fees.value("remainingWei"));
     m_lastTransactionFeeLimit = vexFromWei(fees.value("lastMaximumFeeWei"));
 }
+void AppState::applyTransaction(const QJsonObject &pipeline) {
+    const auto phase = pipeline.value("status").toString();
+    m_transactionStatus = phase == "tx-submission" ? "Submitting"
+                          : phase == "receipt-tracking" ? "Tracking receipt"
+                          : phase == "preflight" ? "Preparing transaction"
+                          : phase == "uncertain" ? "Reconciliation required" : "Idle";
+    m_pendingTransactions = pipeline.value("pending").toInt();
+}
 void AppState::applyMinerEvent(const QJsonObject &event) {
     if (!m_running)
         return;
@@ -1191,6 +1192,12 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
     const auto data = event.value("data").toObject();
     if (type == "inspection") {
         applyInspection(data);
+        return;
+    }
+    if (type == "transaction") {
+        applyTransaction(data);
+        emit statsChanged();
+        emit miningChanged();
         return;
     }
     if (type == "error") {
@@ -1237,6 +1244,7 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
     if (type != "state" && type != "mine-result")
         return;
     applyFees(data.value("fees").toObject());
+    applyTransaction(data.value("transactionPipeline").toObject());
     if (m_pendingAction == "claim") {
         emit statsChanged();
         return;
@@ -1246,6 +1254,7 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
     m_sessionRejected = data.value("rejected").toInt();
     m_sessionHashes = data.value("hashes").toVariant().toString();
     const auto phase = data.value("status").toString();
+    m_candidateQueueDepth = data.value("candidateQueueDepth").toInt();
     m_engineHolds.clear();
     if (phase == "paused")
         m_engineHolds.insert("manual");
@@ -1278,7 +1287,9 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
     else if (phase == "paused-resource")
         m_miningStatus = "Waiting for CPU or memory";
     else if (phase == "waiting-beacon-or-recovery")
-        m_miningStatus = "Waiting for verified beacon";
+        m_miningStatus = "Refreshing mining work";
+    else if (phase == "rpc-degraded")
+        m_miningStatus = "RPC degraded";
     else
         m_miningStatus = phase;
     if (type == "mine-result" && m_sessionEndStatus.isEmpty())

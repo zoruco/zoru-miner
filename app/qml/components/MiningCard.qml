@@ -30,6 +30,7 @@ Card {
         }
     }
     Text { visible: root.state.mining || root.state.lastMeasuredHashrate !== "—"; text: root.state.mining ? root.state.miningExplanation : "Stopped · no CPU work is running."; color: P.color("muted"); font.pixelSize: 14; Layout.fillWidth: true; wrapMode: Text.WordWrap }
+    Text { visible: root.state.mining; text: "Transactions: " + root.state.transactionStatus + " · Pending: " + root.state.pendingTransactions + " · Candidates queued: " + root.state.candidateQueueDepth; color: P.color("muted"); font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
     Text { visible: root.state.lastMeasuredHashrate!=="—"; text: "Last measured: "+root.state.lastMeasuredHashrate+" · "+root.state.lastMeasuredAt; color: P.color("faint"); font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap }
     LineChart { implicitHeight: 180; Layout.fillWidth: true; Layout.fillHeight: true; samples: root.state.hashrateSamples; unit: "H/s"; emptyText: root.state.mining ? "Hashrate history appears after CPU work is measured." : "Start mining to see your hashrate history." }
 }

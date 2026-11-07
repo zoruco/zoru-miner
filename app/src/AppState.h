@@ -56,6 +56,9 @@ class AppState final : public QObject {
     Q_PROPERTY(QString miningBlocker READ miningBlocker NOTIFY readinessChanged)
     Q_PROPERTY(QString miningIssue READ miningIssue NOTIFY miningChanged)
     Q_PROPERTY(QString miningStatus READ miningStatus NOTIFY miningChanged)
+    Q_PROPERTY(QString transactionStatus READ transactionStatus NOTIFY statsChanged)
+    Q_PROPERTY(int candidateQueueDepth READ candidateQueueDepth NOTIFY statsChanged)
+    Q_PROPERTY(int pendingTransactions READ pendingTransactions NOTIFY statsChanged)
     Q_PROPERTY(QString processStatus READ processStatus NOTIFY miningChanged)
     Q_PROPERTY(QString networkReadiness READ networkReadiness NOTIFY readinessChanged)
     Q_PROPERTY(bool beaconVerified READ beaconVerified NOTIFY readinessChanged)
@@ -143,6 +146,9 @@ class AppState final : public QObject {
     QString miningBlocker() const;
     QString miningIssue() const { return m_lastMiningIssue; }
     QString miningStatus() const { return m_miningStatus; }
+    QString transactionStatus() const { return m_transactionStatus; }
+    int candidateQueueDepth() const { return m_candidateQueueDepth; }
+    int pendingTransactions() const { return m_pendingTransactions; }
     QString processStatus() const { return m_miningStatus; }
     QString networkReadiness() const;
     bool beaconVerified() const {
@@ -250,6 +256,7 @@ class AppState final : public QObject {
     void applyMinerEvent(const QJsonObject &event);
     void applyInspection(const QJsonObject &data);
     void applyFees(const QJsonObject &fees);
+    void applyTransaction(const QJsonObject &pipeline);
     void completed(const QString &action, const QJsonObject &result);
     void launchMiner(QByteArray password);
     void beginUpdateInstall();
@@ -281,6 +288,9 @@ class AppState final : public QObject {
     QString m_network = "Connecting", m_height = "—", m_latency = "—", m_tokenBalance = "—",
             m_nativeBalance = "—", m_totalSupply = "—", m_reward = "—", m_epoch = "—",
             m_difficulty = "—";
+    QString m_transactionStatus = "Idle";
+    int m_candidateQueueDepth = 0, m_pendingTransactions = 0;
+    bool m_journalPending = false;
     QString m_miningStatus = "Standby", m_historyStatus = "Set up a wallet to view your activity",
             m_confirmedRewards = "—", m_selectedId, m_selectedDigest;
     QString m_myPending = "—", m_myUnclaimed = "—", m_lastMiningIssue, m_sessionEndStatus;
