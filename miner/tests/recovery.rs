@@ -41,6 +41,16 @@ fn rpc_fee_quote_is_signed_and_total_fee_budget_blocks_excessive_quotes() {
     )
     .unwrap();
     c.verify().unwrap();
+    // Earlier fixtures may finish close to an epoch boundary. Pin this quote
+    // test near a fresh epoch before disabling interval mining, so openEpoch
+    // does not expire between gas estimation and inclusion.
+    let now = c.now().unwrap();
+    let launch = c.manifest.launch_time;
+    let next = launch + ((now.saturating_sub(launch)) / 60 + 1) * 60 + 1;
+    c.read
+        .request("evm_setNextBlockTimestamp", json!([next]))
+        .unwrap();
+    c.read.request("evm_mine", json!([])).unwrap();
     // Keep the quote stable while checking exact signing. Other fixtures use
     // interval mining to exercise real epoch progress during hashing.
     c.read.request("evm_setIntervalMining", json!([0])).unwrap();

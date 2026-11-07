@@ -429,11 +429,7 @@ impl Client {
         Ok(())
     }
     pub fn call(&self, to: Address, signature: &str, words: &[B256]) -> Result<String> {
-        let value = self.read.request(
-            "eth_call",
-            json!([{"to":to,"data":abi::call(signature,words)},"latest"]),
-        )?;
-        Ok(value.as_str().context("Invalid ABI response")?.into())
+        self.call_at(to, signature, words, "latest")
     }
     pub fn number(&self, to: Address, sig: &str) -> Result<U256> {
         abi::scalar(&self.call(to, sig, &[])?)
@@ -641,7 +637,7 @@ impl Client {
         });
         Ok(work)
     }
-    fn call_at(
+    pub(crate) fn call_at(
         &self,
         to: Address,
         signature: &str,
@@ -665,6 +661,9 @@ impl Client {
             return Ok(None);
         }
         if abi::boolean(&self.call_at(d.ledger, "admissionPaused()", &[], height)?)? {
+            return Ok(None);
+        }
+        if abi::abi_address(&self.call_at(d.token, "issuer()", &[], height)?)? != d.ledger {
             return Ok(None);
         }
         let word = abi::uint(U256::from(epoch));
@@ -767,7 +766,12 @@ impl Client {
         for path in fs::read_dir(&self.journal)? {
             let path = path?.path();
             if path.extension().is_some_and(|e| e == "json") {
-                let record: Journal = serde_json::from_slice(&fs::read(path)?)?;
+                let bytes = match fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let record: Journal = serde_json::from_slice(&bytes)?;
                 ensure!(
                     record.account == account && record.chain_id == self.manifest.chain_id,
                     "Journal network or account mismatch"
@@ -1028,7 +1032,11 @@ impl Client {
                         "Proof journal has no work context; retain it until its receipt or closed epoch can be reconciled"
                     )?;
                     ensure!(
-                        expected.epoch == epoch && self.work(account)?.as_ref() == Some(expected),
+                        expected.epoch == epoch
+                            && self.work(account)?.as_ref() == Some(expected)
+                            && self
+                                .work_deadline()
+                                .is_some_and(|deadline| Instant::now() < deadline),
                         "Signed proof work has changed; retain the journal without rebroadcasting"
                     );
                 }
@@ -1053,6 +1061,7 @@ impl Client {
                 "Transaction is pending; retain the signed journal without rebroadcasting"
             );
             self.identity()?;
+            verify_evm_chain(&self.submit, self.manifest.chain_id)?;
             ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
             let broadcast = self
                 .submit
@@ -1184,8 +1193,11 @@ impl Client {
         );
         if let Some(work) = expected {
             ensure!(
-                self.epoch()? == work.epoch && mining_window_open(self.now()?, work.end_time),
-                "STALE_WORK: inclusion window closing"
+                self.work(account)?.as_ref() == Some(work)
+                    && self
+                        .work_deadline()
+                        .is_some_and(|deadline| Instant::now() < deadline),
+                "STALE_WORK: work changed or inclusion window closing"
             );
         }
         let tx = TxLegacy {
@@ -1261,9 +1273,10 @@ impl Client {
                 }
                 if let Some(work) = expected {
                     ensure!(
-                        mining_window_open(self.now()?, work.end_time)
-                            && self.number(self.manifest.ledger, "moduleGeneration()")?
-                                == work.generation,
+                        self.work(account)?.as_ref() == Some(work)
+                            && self
+                                .work_deadline()
+                                .is_some_and(|deadline| Instant::now() < deadline),
                         "STALE_WORK: retry context expired; retain the signed journal"
                     );
                 }
@@ -1380,6 +1393,10 @@ mod tests {
             ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
             ("eth_getBlockByNumber", block.clone()),
             ("eth_call", encoded(&[B256::ZERO])),
+            (
+                "eth_call",
+                encoded(&[abi::address(Address::repeat_byte(2))]),
+            ),
             ("eth_call", encoded(&info)),
             ("eth_call", encoded(&[abi::uint(work.target)])),
             ("eth_call", encoded(&[abi::uint(work.generation)])),
@@ -1408,27 +1425,38 @@ mod tests {
         assert_eq!(c.work(beneficiary).unwrap(), Some(work));
         assert_eq!(
             c.read.request_count(),
-            8,
+            9,
             "the second read must use the block cache"
         );
         assert!(c.work_deadline().unwrap() <= Instant::now() + Duration::from_secs(5));
         server.join().unwrap();
     }
     #[test]
-    fn proof_limit_and_sealed_epochs_do_not_produce_hashing_work() {
-        for sealed in [false, true] {
+    fn proof_limits_sealing_and_inactive_issuer_stop_work() {
+        for (sealed, revoked) in [(false, false), (true, false), (false, true)] {
             let mut info = [B256::ZERO; 10];
             info[3] = abi::uint(U256::from(if sealed { 0 } else { 5 }));
             info[6] = abi::uint(U256::from(u8::from(sealed)));
-            let (url, server) = crate::rpc::tests::sequence(vec![
+            let mut responses = vec![
                 ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
                 (
                     "eth_getBlockByNumber",
                     json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"}),
                 ),
                 ("eth_call", encoded(&[B256::ZERO])),
-                ("eth_call", encoded(&info)),
-            ]);
+                (
+                    "eth_call",
+                    encoded(&[abi::address(Address::repeat_byte(if revoked {
+                        99
+                    } else {
+                        2
+                    }))]),
+                ),
+            ];
+            if !revoked {
+                responses.push(("eth_call", encoded(&info)));
+            }
+            let (url, server) = crate::rpc::tests::sequence(responses);
             let dir = tempfile::tempdir().unwrap();
             let c = Client::new(
                 fixture_manifest(),

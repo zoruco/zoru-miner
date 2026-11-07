@@ -8,6 +8,14 @@ use std::{
 };
 
 pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json(path, value, true)
+}
+
+pub fn create_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json(path, value, false)
+}
+
+fn write_json(path: &Path, value: &impl Serialize, replace: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Missing state directory"))?;
@@ -22,7 +30,11 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer(&mut file, value)?;
     file.write_all(b"\n")?;
     file.as_file().sync_all()?;
-    file.persist(path)?;
+    if replace {
+        file.persist(path)?;
+    } else {
+        file.persist_noclobber(path)?;
+    }
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())

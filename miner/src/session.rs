@@ -13,6 +13,7 @@ use rand::RngCore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashSet, VecDeque},
     fs,
     io::Read,
     path::PathBuf,
@@ -26,7 +27,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-pub type Emit = Arc<dyn Fn(Value) + Send + Sync>;
+pub use crate::Emit;
 #[derive(Clone)]
 pub struct Options {
     pub manifest: PathBuf,
@@ -49,11 +50,90 @@ pub struct Run {
     pub auto_claim_after: u64,
     pub dry_run: bool,
 }
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            workers: 1,
+            cpu_budget: 0.5,
+            seconds: 0,
+            max_accepted: 0,
+            auto_claim_after: 50,
+            dry_run: false,
+        }
+    }
+}
+impl Run {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            [1, 2, 4].contains(&self.workers)
+                && self.cpu_budget.is_finite()
+                && self.cpu_budget > 0.0
+                && self.cpu_budget <= 2.0,
+            "Choose 1, 2 or 4 workers and a CPU budget greater than 0 and at most 2 cores"
+        );
+        Ok(())
+    }
+}
 #[derive(Clone)]
 struct Candidate {
     work: Work,
     nonce: U256,
     digest: B256,
+}
+
+// Extend the existing bounded channel with admission metrics and bounded
+// duplicate suppression. Hash workers never wait for its receiver.
+struct Candidates {
+    sender: mpsc::SyncSender<Candidate>,
+    recent: Mutex<(HashSet<B256>, VecDeque<B256>)>,
+    depth: AtomicU64,
+    overflow: AtomicU64,
+    duplicates: AtomicU64,
+}
+impl Candidates {
+    fn new() -> (Arc<Self>, mpsc::Receiver<Candidate>) {
+        let (sender, receiver) = mpsc::sync_channel(64);
+        (
+            Arc::new(Self {
+                sender,
+                recent: Mutex::new((HashSet::new(), VecDeque::new())),
+                depth: AtomicU64::new(0),
+                overflow: AtomicU64::new(0),
+                duplicates: AtomicU64::new(0),
+            }),
+            receiver,
+        )
+    }
+    fn push(&self, candidate: Candidate) -> bool {
+        let mut recent = self.recent.lock().unwrap();
+        if recent.0.contains(&candidate.digest) {
+            self.duplicates.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let digest = candidate.digest;
+        if self
+            .depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                (depth < 64).then_some(depth + 1)
+            })
+            .is_err()
+        {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.sender.try_send(candidate).is_err() {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        recent.0.insert(digest);
+        recent.1.push_back(digest);
+        if recent.1.len() > 1024 {
+            let oldest = recent.1.pop_front().unwrap();
+            recent.0.remove(&oldest);
+        }
+        true
+    }
 }
 pub struct Session {
     pub client: Arc<Client>,
@@ -62,6 +142,7 @@ pub struct Session {
     pub stop: Arc<AtomicBool>,
     pub pause: Arc<AtomicBool>,
     work: Arc<RwLock<Option<Work>>>,
+    work_deadline: Mutex<Instant>,
     stats: Mutex<Value>,
     history: History,
     state_dir: PathBuf,
@@ -224,6 +305,12 @@ where
 impl Session {
     pub fn connect(options: Options, password: Zeroizing<String>, emit: Emit) -> Result<Arc<Self>> {
         let manifest = Manifest::load(&options.manifest)?;
+        if let Some(path) = &options.wallet {
+            ensure!(
+                path.is_file(),
+                "Encrypted wallet not found; review setup or --wallet"
+            );
+        }
         let signer = options
             .wallet
             .as_ref()
@@ -267,6 +354,7 @@ impl Session {
             journal,
             options.state_dir.join("receipts"),
         )?;
+        *client.observer.lock().unwrap() = Some(emit.clone());
         client.fees.lock().unwrap().set_limit(options.fee_budget)?;
         let revision = client.verify()?;
         if signer.is_some() {
@@ -279,6 +367,7 @@ impl Session {
         )?;
         let paid = history.paid()?;
         let chain_id = client.manifest.chain_id;
+        let client_mode = client.manifest.mode.clone();
         let result = Arc::new(Self {
             stop: client.cancelled.clone(),
             client,
@@ -286,8 +375,9 @@ impl Session {
             account,
             pause: Arc::new(AtomicBool::new(false)),
             work: Arc::new(RwLock::new(None)),
+            work_deadline: Mutex::new(Instant::now()),
             stats: Mutex::new(
-                json!({"status":"connected","address":if account==Address::ZERO{String::new()}else{format!("{account:#x}")},"chainId":chain_id,"hashes":0,"validFound":0,"accepted":0,"rejected":0,"staleBeforeBroadcast":0,"resourcePauses":0,"hashesPerSecond":0,"rewardPaidBaseUnits":paid.to_string(),"contexts":[],"events":[],"beaconsPublished":[],"errors":[],"warnings":[],"runOutcome":"not-started"}),
+                json!({"status":"connected","address":if account==Address::ZERO{String::new()}else{format!("{account:#x}")},"chainId":chain_id,"deploymentMode":client_mode,"hashes":0,"validFound":0,"accepted":0,"rejected":0,"staleBeforeBroadcast":0,"resourcePauses":0,"hashesPerSecond":0,"rewardPaidBaseUnits":paid.to_string(),"contexts":[],"events":[],"beaconsPublished":[],"errors":[],"warnings":[],"runOutcome":"not-started"}),
             ),
             history,
             state_dir: options.state_dir,
@@ -327,6 +417,12 @@ impl Session {
             stats.clone()
         };
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
+        data["transactionPipeline"] = self.client.pipeline.lock().unwrap().clone();
+        data["pendingTransactions"] = data["transactionPipeline"]["pending"].clone();
+        data["rpcRequests"] =
+            json!(self.client.read.request_count() + self.client.submit.request_count());
+        data["rpc"] =
+            json!({"read":self.client.read.metrics(),"submit":self.client.submit.metrics()});
         if self.signer.is_some() {
             storage::atomic_json(&self.state_dir.join("progress.json"), &data)?;
         }
@@ -338,7 +434,9 @@ impl Session {
         if text.starts_with("FEE_BUDGET_EXHAUSTED:") {
             self.stop.store(true, Ordering::SeqCst);
         }
-        if text == "Signing stopped" && self.stop.load(Ordering::Relaxed) {
+        if (text.starts_with("Signing stopped") || text == "Inspection stopped")
+            && self.stop.load(Ordering::Relaxed)
+        {
             return;
         }
         let stale = is_stale_candidate(&text);
@@ -350,8 +448,10 @@ impl Session {
                 .unwrap()
                 .push(json!({"message":text}));
         } else {
-            if attempt {
+            if attempt && text.starts_with("Transaction reverted:") {
                 set_counter(&mut stats, "rejected", 1);
+            } else if attempt {
+                set_counter(&mut stats, "submissionErrors", 1);
             }
             stats["errors"]
                 .as_array_mut()
@@ -359,13 +459,20 @@ impl Session {
                 .push(json!({"message":text}));
         }
         drop(stats);
+        if attempt && text.starts_with("Transaction reverted:") {
+            self.event("REJECTED", &text);
+        }
         if stale {
             (self.emit)(json!({"event":"warning","warning":text}));
         } else {
             (self.emit)(json!({"event":"error","error":text}));
         }
     }
+    fn event(&self, category: &str, message: &str) {
+        (self.emit)(json!({"event":"mining-event","category":category,"message":message}));
+    }
     pub fn inspect(&self) -> Result<Value> {
+        ensure!(!self.stop.load(Ordering::Relaxed), "Inspection stopped");
         let c = &self.client;
         let d = &c.manifest;
         let inspected_at = Instant::now();
@@ -374,11 +481,10 @@ impl Session {
             .request("eth_getBlockByNumber", json!(["latest", false]))?;
         let height = block["number"].as_str().context("Block height missing")?;
         let call = |to: Address, signature: &str, words: &[B256]| -> Result<String> {
-            let result = c.read.request(
-                "eth_call",
-                json!([{"to":to,"data":abi::call(signature, words)},height]),
-            )?;
-            Ok(result.as_str().context("Invalid ABI response")?.to_owned())
+            // Bound shutdown by one in-flight request, rather than a full
+            // sequence of contract reads on a slow endpoint.
+            ensure!(!self.stop.load(Ordering::Relaxed), "Inspection stopped");
+            c.call_at(to, signature, words, height)
         };
         let number = |to, signature| abi::scalar(&call(to, signature, &[])?);
         let allocated = number(d.ledger, "allocatedSupply()")?;
@@ -412,6 +518,8 @@ impl Session {
         let admission_paused = abi::boolean(&call(d.ledger, "admissionPaused()", &[])?)?;
         let mut data = json!({
             "chainId":d.chain_id,
+            "deploymentMode":d.mode,
+            "tokenDecimals":d.decimals,
             "transactionFeeCapWei":crate::protocol::MAX_TRANSACTION_FEE.to_string(),
             "blockNumber":int(&block["number"])?.to_string(),
             "blockHash":block["hash"],
@@ -451,16 +559,14 @@ impl Session {
                 json!(abi::number(info[2]).to_string())
             };
             data["currentEpochProofs"] = json!(abi::number(info[3]).to_string());
+            data["epochEndsAt"] =
+                json!(d.launch_time + (abi::quantity(epoch)?.to::<u64>() + 1) * d.epoch_seconds);
+            data["generation"] = json!(number(d.ledger, "moduleGeneration()")?.to_string());
+            data["seed"] = json!(info[1]);
             let target = call(d.ledger, "targetForEpoch(uint48)", &[word]);
             data["target"] = match target {
                 Ok(value) => json!(abi::scalar(&value)?.to_string()),
-                Err(error)
-                    if admission_paused
-                        || claims_paused
-                        || error.to_string().ends_with("0xd5b25b63") =>
-                {
-                    Value::Null
-                }
+                Err(error) if crate::protocol::work_unavailable(&error) => Value::Null,
                 Err(error) => return Err(error),
             };
             if let Some(target) = data["target"].as_str() {
@@ -476,6 +582,7 @@ impl Session {
         data["fees"] = c.fees.lock().unwrap().snapshot();
         if self.account != Address::ZERO {
             data["address"] = json!(self.account);
+            data["pendingJournals"] = json!(c.pending_journals(self.account)?);
             data["nativeBalanceWei"] = json!(
                 int(&c
                     .read
@@ -725,6 +832,15 @@ impl Session {
             current.as_ref() == Some(&candidate.work),
             "STALE_WORK: context changed before submission"
         );
+        ensure!(
+            self.history.get(candidate.digest)?.is_none(),
+            "Duplicate candidate already recorded"
+        );
+        let verified = pow::digest(&candidate.work, self.account, candidate.nonce);
+        ensure!(
+            pow::valid(verified, candidate.work.target) && verified == candidate.digest,
+            "Invalid local proof candidate"
+        );
         let data = abi::call(
             "submit(uint48,address,uint256)",
             &[
@@ -767,6 +883,11 @@ impl Session {
         let mut stats = self.stats.lock().unwrap();
         set_counter(&mut stats, "accepted", 1);
         stats["events"].as_array_mut().unwrap().push(json!({"hash":proof.hash,"digest":proof.digest,"epoch":proof.epoch,"generation":proof.generation.to_string(),"gasUsed":gas_used,"candidateToReceiptSeconds":started.elapsed().as_secs_f64()}));
+        drop(stats);
+        self.event(
+            "ACCEPTED",
+            &format!("Proof confirmed in block {} · {}", proof.block, proof.hash),
+        );
         Ok(())
     }
     pub fn begin_action(&self) {
@@ -883,7 +1004,7 @@ impl Session {
             }
         }
         self.stats.lock().unwrap()["rewardPaidBaseUnits"] = json!(self.history.paid()?.to_string());
-        if inspect {
+        if inspect && !self.stop.load(Ordering::Relaxed) {
             self.inspect()?;
         }
         self.publish()?;
@@ -894,12 +1015,7 @@ impl Session {
             options.dry_run || self.signer.is_some(),
             "Unlock a mainnet wallet"
         );
-        ensure!(
-            [1, 2, 4].contains(&options.workers)
-                && options.cpu_budget > 0.0
-                && options.cpu_budget <= 2.0,
-            "Choose 1,2 or4 workers and at most2 CPU cores"
-        );
+        options.validate()?;
         {
             let mut stats = self.stats.lock().unwrap();
             for name in [
@@ -911,6 +1027,7 @@ impl Session {
                 "autoClaimed",
                 "staleBeforeBroadcast",
                 "dryRunCandidates",
+                "submissionErrors",
             ] {
                 stats[name] = json!(0);
             }
@@ -924,6 +1041,25 @@ impl Session {
                 stats[name] = json!([]);
             }
         }
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats["workers"] = json!(options.workers);
+            stats["cpuBudgetCores"] = json!(options.cpu_budget);
+            stats["autoClaimAfter"] = json!(if options.dry_run {
+                0
+            } else {
+                options.auto_claim_after
+            });
+            stats["dryRun"] = json!(options.dry_run);
+            stats["autoClaimStatus"] = json!(if options.auto_claim_after == 0 || options.dry_run {
+                "disabled"
+            } else {
+                "watching"
+            });
+            stats["candidateQueueCapacity"] = json!(64);
+        }
+        *self.work.write().unwrap() = None;
+        *self.work_deadline.lock().unwrap() = Instant::now();
         let started = Instant::now();
         let cpu_begin = process_cpu();
         let requests_begin = self.client.read.request_count()
@@ -936,10 +1072,9 @@ impl Session {
         let hashes = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
-        let claiming = Arc::new(AtomicBool::new(false));
         // Only proof candidates are queued. Beacon publication is selected
         // from the current epoch by the writer, after any slow transaction.
-        let (tx, rx) = mpsc::sync_channel::<Candidate>(64);
+        let (candidates, rx) = Candidates::new();
         let run = self.clone();
         let poll = thread::spawn(move || {
             while !run.stop.load(Ordering::Relaxed) {
@@ -948,6 +1083,10 @@ impl Session {
                         if let Some(ref work) = fresh {
                             let changed = run.work.read().unwrap().as_ref() != Some(work);
                             if changed {
+                                // Cancel the old context before any potentially slow
+                                // implementation verification for a new generation.
+                                *run.work.write().unwrap() = None;
+                                *run.work_deadline.lock().unwrap() = Instant::now();
                                 let verify = (|| -> Result<()> {
                                     let mut rev = run.revision.lock().unwrap();
                                     if *rev != work.generation {
@@ -965,22 +1104,62 @@ impl Session {
                                     thread::sleep(Duration::from_secs(1));
                                     continue;
                                 }
-                                run.stats.lock().unwrap()["contexts"].as_array_mut().unwrap().push(json!({"epoch":work.epoch,"generation":work.generation.to_string(),"target":work.target.to_string(),"seed":work.seed}));
+                                run.stats.lock().unwrap()["contexts"].as_array_mut().unwrap().push(json!({"epoch":work.epoch,"generation":work.generation.to_string(),"target":work.target.to_string(),"seed":work.seed,"endTime":work.end_time}));
+                                run.event(
+                                    "EPOCH",
+                                    &format!(
+                                        "Work activated · epoch {} · generation {}",
+                                        work.epoch, work.generation
+                                    ),
+                                );
                             }
                         }
-                        *run.work.write().unwrap() = fresh.clone();
+                        *run.work_deadline.lock().unwrap() =
+                            run.client.work_deadline().unwrap_or_else(Instant::now);
+                        *run.work.write().unwrap() = fresh;
+                        run.stats.lock().unwrap()["rpcHealthy"] = json!(true);
                     }
                     Err(error) => {
                         *run.work.write().unwrap() = None;
+                        run.stats.lock().unwrap()["rpcHealthy"] = json!(false);
                         run.error(error, false)
                     }
                 }
-                thread::sleep(Duration::from_millis(700));
+                for _ in 0..12 {
+                    if run.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        // Wallet/global snapshots belong to the shared session. Neither frontend
+        // creates its own mining-time RPC loop, and a slow history read cannot
+        // delay the work poller.
+        let run = self.clone();
+        let snapshots = thread::spawn(move || {
+            while !run.stop.load(Ordering::Relaxed) {
+                let result = (|| -> Result<()> {
+                    if run.account != Address::ZERO {
+                        run.sync_history()?;
+                    }
+                    run.inspect()?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    run.error(error, false);
+                }
+                for _ in 0..150 {
+                    if run.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         });
         let run = self.clone();
         let writer_resource = resource.clone();
-        let writer_claiming = claiming.clone();
+        let writer_queue = candidates.clone();
         let accepted_limit = options.max_accepted;
         let writer = thread::spawn(move || {
             let mut claim_retry = Instant::now();
@@ -1025,7 +1204,11 @@ impl Session {
                     if !claims_open {
                         claim_retry = Instant::now() + Duration::from_secs(2);
                     } else {
-                        writer_claiming.store(true, Ordering::Relaxed);
+                        run.stats.lock().unwrap()["autoClaimStatus"] = json!("claiming");
+                        run.event(
+                            "CLAIM",
+                            "Settling eligible rewards; hashing continues on valid work",
+                        );
                         let mut completed = 0;
                         match run.settle_batch(1, false) {
                             Ok(result) => {
@@ -1043,7 +1226,7 @@ impl Session {
                             }
                             Err(error) => run.error(error, false),
                         }
-                        writer_claiming.store(false, Ordering::Relaxed);
+                        run.stats.lock().unwrap()["autoClaimStatus"] = json!("watching");
                         run.stats.lock().unwrap()["autoClaimRemaining"] = json!(claims_remaining);
                         claim_retry = Instant::now()
                             + Duration::from_secs(if completed > 0 { 5 } else { 30 });
@@ -1071,6 +1254,7 @@ impl Session {
                 }
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(candidate) => {
+                        writer_queue.depth.fetch_sub(1, Ordering::Relaxed);
                         // The bounded queue may still contain work from the
                         // previous epoch after the poller has refreshed it.
                         // Drop those results here instead of logging each one
@@ -1105,20 +1289,20 @@ impl Session {
         let duty = (options.cpu_budget / options.workers as f64).min(0.8);
         for _ in 0..options.workers {
             let run = self.clone();
-            let tx = tx.clone();
+            let queue = candidates.clone();
             let hashes = hashes.clone();
             let found = found.clone();
             let resources = resource.clone();
-            let claiming = claiming.clone();
             workers.push(thread::spawn(move || {
                 let mut raw = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut raw);
                 let mut nonce = U256::from_be_bytes(raw);
                 while !run.stop.load(Ordering::Relaxed) {
-                    if run.pause.load(Ordering::Relaxed)
-                        || resources.load(Ordering::Relaxed)
-                        || claiming.load(Ordering::Relaxed)
-                    {
+                    if run.pause.load(Ordering::Relaxed) || resources.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    if Instant::now() >= *run.work_deadline.lock().unwrap() {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
@@ -1137,11 +1321,24 @@ impl Session {
                             count += 1;
                             if pow::valid(digest, work.target) {
                                 found.fetch_add(1, Ordering::Relaxed);
-                                let _ = tx.try_send(Candidate {
+                                let queued = queue.push(Candidate {
                                     work: work.clone(),
                                     nonce,
                                     digest,
                                 });
+                                // Candidate progress is rate limited independently of hashrate.
+                                if found.load(Ordering::Relaxed) % 32 == 1 {
+                                    run.event(
+                                        "FOUND",
+                                        &format!("Valid local candidate · nonce {nonce:#x}"),
+                                    );
+                                    if queued {
+                                        run.event(
+                                            "QUEUED",
+                                            "Candidate awaiting the transaction writer",
+                                        );
+                                    }
+                                }
                             }
                             nonce = nonce.wrapping_add(U256::from(1));
                         }
@@ -1156,20 +1353,22 @@ impl Session {
                 }
             }));
         }
-        {
-            let mut stats = self.stats.lock().unwrap();
-            stats["workers"] = json!(options.workers);
-            stats["cpuBudgetCores"] = json!(options.cpu_budget);
-            stats["autoClaimAfter"] = json!(if options.dry_run {
-                0
-            } else {
-                options.auto_claim_after
-            });
-            stats["dryRun"] = json!(options.dry_run);
-            stats["liveTransactions"] = json!(0);
-        }
         let mut runtime_error = None;
+        let mut measured_at = Instant::now();
+        let mut measured_hashes = 0;
+        let mut last_status = String::new();
         loop {
+            if !self.stop.load(Ordering::Relaxed)
+                && (poll.is_finished()
+                    || writer.is_finished()
+                    || snapshots.is_finished()
+                    || workers.iter().any(thread::JoinHandle::is_finished))
+            {
+                runtime_error = Some(anyhow::anyhow!(
+                    "A mining thread exited unexpectedly; signed journals are retained"
+                ));
+                break;
+            }
             if self.stop.load(Ordering::Relaxed)
                 || (options.seconds > 0
                     && started.elapsed() >= Duration::from_secs(options.seconds))
@@ -1186,11 +1385,13 @@ impl Session {
             }
             stats["status"] = json!(if self.pause.load(Ordering::Relaxed) {
                 "paused"
-            } else if claiming.load(Ordering::Relaxed) {
-                "claiming"
             } else if blocked {
                 "paused-resource"
-            } else if self.work.read().unwrap().is_none() {
+            } else if stats["rpcHealthy"] == false {
+                "rpc-degraded"
+            } else if self.work.read().unwrap().is_none()
+                || Instant::now() >= *self.work_deadline.lock().unwrap()
+            {
                 "waiting-beacon-or-recovery"
             } else {
                 "mining"
@@ -1198,13 +1399,31 @@ impl Session {
             if blocked {
                 set_counter(&mut stats, "resourcePauses", 1);
             }
+            stats["candidateQueueDepth"] = json!(candidates.depth.load(Ordering::Relaxed));
+            stats["candidateQueueOverflow"] = json!(candidates.overflow.load(Ordering::Relaxed));
+            stats["duplicateCandidates"] = json!(candidates.duplicates.load(Ordering::Relaxed));
             stats["hashes"] = json!(hashes.load(Ordering::Relaxed));
             stats["validFound"] = json!(found.load(Ordering::Relaxed));
             stats["elapsedSeconds"] = json!(started.elapsed().as_secs_f64());
+            let total = hashes.load(Ordering::Relaxed);
             stats["hashesPerSecond"] = json!(
-                hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001)
+                (total - measured_hashes) as f64 / measured_at.elapsed().as_secs_f64().max(0.001)
             );
+            measured_hashes = total;
+            measured_at = Instant::now();
+            let status = stats["status"].as_str().unwrap_or_default().to_owned();
             drop(stats);
+            if status != last_status {
+                self.event(
+                    if status == "mining" {
+                        "HASHING"
+                    } else {
+                        "WARNING"
+                    },
+                    &status,
+                );
+                last_status = status;
+            }
             if let Err(error) = self.publish() {
                 runtime_error = Some(error);
                 break;
@@ -1212,11 +1431,17 @@ impl Session {
             thread::sleep(Duration::from_millis(500));
         }
         self.stop.store(true, Ordering::Relaxed);
+        let mut thread_failed = false;
         for worker in workers {
-            let _ = worker.join();
+            thread_failed |= worker.join().is_err();
         }
-        let _ = poll.join();
-        let _ = writer.join();
+        thread_failed |= poll.join().is_err();
+        thread_failed |= writer.join().is_err();
+        thread_failed |= snapshots.join().is_err();
+        ensure!(
+            !thread_failed,
+            "A mining thread failed; signed journals are retained"
+        );
         if let Some(error) = runtime_error {
             return Err(error);
         }
@@ -1224,6 +1449,9 @@ impl Session {
             let mut stats = self.stats.lock().unwrap();
             stats["status"] = json!("stopped");
             stats["elapsedSeconds"] = json!(started.elapsed().as_secs_f64());
+            stats["candidateQueueDepth"] = json!(0);
+            stats["candidateQueueOverflow"] = json!(candidates.overflow.load(Ordering::Relaxed));
+            stats["duplicateCandidates"] = json!(candidates.duplicates.load(Ordering::Relaxed));
             stats["hashes"] = json!(hashes.load(Ordering::Relaxed));
             stats["hashesPerSecond"] = json!(
                 hashes.load(Ordering::Relaxed) as f64 / started.elapsed().as_secs_f64().max(0.001)
@@ -1246,6 +1474,12 @@ impl Session {
                 .map_or(0, |rpc| rpc.request_count())
             - requests_begin;
         data["rpcRequests"] = json!(requests);
+        data["rpcRequestsPerMinute"] =
+            json!(requests as f64 * 60.0 / started.elapsed().as_secs_f64().max(0.001));
+        data["rpc"] =
+            json!({"read":self.client.read.metrics(),"submit":self.client.submit.metrics()});
+        data["transactionPipeline"] = self.client.pipeline.lock().unwrap().clone();
+        data["pendingTransactions"] = data["transactionPipeline"]["pending"].clone();
         data["rpcRequestsPerAcceptedProof"] = match data["accepted"].as_u64() {
             Some(accepted) if accepted > 0 => json!(requests as f64 / accepted as f64),
             _ => Value::Null,
@@ -1494,5 +1728,72 @@ mod mining_outcome_tests {
             mining_outcome(&json!({"accepted":0,"rejected":1,"errors":[]})),
             "failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    fn candidate(nonce: u64) -> Candidate {
+        Candidate {
+            work: Work {
+                chain_id: 6736,
+                ledger: Address::repeat_byte(1),
+                token: Address::repeat_byte(2),
+                generation: U256::from(1),
+                epoch: 1,
+                seed: B256::repeat_byte(3),
+                target: U256::MAX,
+                end_time: 60,
+            },
+            nonce: U256::from(nonce),
+            digest: abi::keccak(&nonce.to_be_bytes()),
+        }
+    }
+    #[test]
+    fn queue_is_bounded_nonblocking_and_suppresses_duplicates() {
+        let (queue, receiver) = Candidates::new();
+        assert!(queue.push(candidate(0)));
+        assert!(!queue.push(candidate(0)));
+        assert_eq!(queue.duplicates.load(Ordering::Relaxed), 1);
+        for n in 1..64 {
+            assert!(queue.push(candidate(n)));
+        }
+        assert!(!queue.push(candidate(65)));
+        assert_eq!(queue.depth.load(Ordering::Relaxed), 64);
+        assert_eq!(queue.overflow.load(Ordering::Relaxed), 1);
+        let next = receiver.recv().unwrap();
+        queue.depth.fetch_sub(1, Ordering::Relaxed);
+        assert!(!queue.push(next));
+        assert!(queue.push(candidate(65)));
+        for n in 100..2200 {
+            receiver.recv().unwrap();
+            queue.depth.fetch_sub(1, Ordering::Relaxed);
+            assert!(queue.push(candidate(n)));
+        }
+        assert_eq!(queue.recent.lock().unwrap().0.len(), 1024);
+        assert_eq!(queue.recent.lock().unwrap().1.len(), 1024);
+    }
+    #[test]
+    fn mining_options_reject_unbounded_or_nonfinite_cpu_use() {
+        for cpu_budget in [f64::NAN, f64::INFINITY, 0.0, -1.0, 2.1] {
+            assert!(
+                Run {
+                    cpu_budget,
+                    ..Run::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            Run {
+                workers: 3,
+                ..Run::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(Run::default().validate().is_ok());
     }
 }

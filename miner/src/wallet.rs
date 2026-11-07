@@ -14,7 +14,7 @@ fn parameter_set(value: &Value, names: &[&str]) -> bool {
     })
 }
 
-pub fn unlock(path: &Path, password: Zeroizing<String>) -> Result<PrivateKeySigner> {
+fn encrypted_snapshot(path: &Path) -> Result<Value> {
     let mut data = Vec::new();
     fs::File::open(path)?
         .take(1024 * 1024 + 1)
@@ -84,6 +84,15 @@ pub fn unlock(path: &Path, password: Zeroizing<String>) -> Result<PrivateKeySign
     if let Some(crypto) = value.as_object_mut().and_then(|v| v.remove("Crypto")) {
         value["crypto"] = crypto;
     }
+    Ok(value)
+}
+
+pub fn validate(path: &Path) -> Result<()> {
+    encrypted_snapshot(path).map(|_| ())
+}
+
+pub fn unlock(path: &Path, password: Zeroizing<String>) -> Result<PrivateKeySigner> {
+    let value = encrypted_snapshot(path)?;
     let mut snapshot = tempfile::NamedTempFile::new()?;
     snapshot.write_all(&serde_json::to_vec(&value)?)?;
     let signer = PrivateKeySigner::decrypt_keystore(snapshot.path(), password.as_bytes())
