@@ -21,13 +21,13 @@ This document tracks implementation on the canonical `main` branch of `zoruco/zo
 
 ## Phase 1 — One-command CLI and configuration
 
-- [ ] Add `zoru-miner-cli setup` for first-run configuration and encrypted-wallet selection.
+- [x] Add `zoru-miner-cli setup` for first-run configuration and encrypted-wallet selection (existing encrypted wallet path; no wallet creation). Saved config and overwrite protections covered by CLI unit tests (2026-11-07).
 - [ ] Support `zoru-miner-cli mine` reading an XDG config by default (Windows equivalent per OS).
 - [ ] Keep explicit flags as overrides, including deployment manifest selection, and validate effective settings.
 - [x] Add `--rpc` as one EVM endpoint, preserving separate internal client pacing and safe submit semantics. CLI and GUI argument builder updated; 4 CLI unit tests passed on VPS1 (2026-11-07).
 - [ ] Remove required `--native` from the CLI only after EVM-only health/identity test coverage. Code now accepts optional native RPC, and GUI defaults to EVM-only; EVM head/chain validation and integration verification remain in progress.
 - [ ] Resolve trusted manifest, state path, workers, CPU budget, and autoclaim defaults automatically.
-- [ ] Define safe wallet unlocking without persisting plaintext password in the TOML config.
+- [ ] Define safe wallet unlocking without persisting plaintext password in the JSON config. Setup stores only paths and RPC; verify end-to-end password handling.
 - [ ] Test clean install, existing installation migration, config precedence, invalid config, and platform paths.
 
 ## Phase 2 — Stable terminal dashboard (TUI)

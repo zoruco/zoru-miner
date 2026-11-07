@@ -27,7 +27,15 @@ See the [App Guide](docs/APP_GUIDE.md) for setup, mining and updates.
 
 ## Command line
 
-Use an encrypted Web3 version 3 wallet and the manifest included with the release. Keep the state directory between runs.
+Use an encrypted Web3 version 3 wallet and the manifest included with the release. Keep the state directory between runs. For first-time CLI setup, run:
+
+```sh
+zoru-miner-cli setup --manifest ./share/zoru-miner/deployment.json \
+  --rpc https://vexascan.com/rpc --wallet ./wallet.json --state-dir ./state
+zoru-miner-cli mine
+```
+
+Setup stores only the manifest, RPC URL, encrypted wallet path and state path (not a password or private key). It refuses to overwrite an existing configuration. The miner prompts for the encrypted wallet password at startup. Explicit CLI flags can still override saved connection settings. GUI continues to use its own preferences and shared Rust engine.
 
 ```sh
 zoru-miner-cli mine \
