@@ -130,6 +130,7 @@ fn prepared(
         label: "recovery-regression".into(),
         receipt: None,
         replacement: None,
+        work: None,
     }
 }
 fn record(c: &Client, j: &Journal) {

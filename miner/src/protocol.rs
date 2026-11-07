@@ -42,11 +42,13 @@ fn mining_window_open(now: u64, end_time: u64) -> bool {
     now < end_time.saturating_sub(INCLUSION_MARGIN_SECONDS)
 }
 
-// Custom error InvalidEpoch() on the pinned ZoruLedger Solidity ABI.
-// 0xd5b25b63 = keccak256("InvalidEpoch()")[..4]. This is NOT a
-// general-purpose revert suppressor: callers must recheck epochNow() too.
-fn is_epoch_boundary_revert(error: &anyhow::Error) -> bool {
-    error.to_string() == "eth_call: RPC error 3 0xd5b25b63"
+pub(crate) fn work_unavailable(error: &anyhow::Error) -> bool {
+    // Exact contract errors for inactive coordinated work; other failures remain errors.
+    ["UpgradePending()", "InvalidEpoch()"]
+        .iter()
+        .any(|signature| {
+            error.to_string() == format!("eth_call: RPC error 3 {}", abi::call(signature, &[]))
+        })
 }
 
 pub const IMPL_SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -212,6 +214,10 @@ pub struct Journal {
     pub label: String,
     pub receipt: Option<Value>,
     pub replacement: Option<B256>,
+    // Older journals still reconcile receipts/nonces. A proof replay additionally
+    // needs the work context that was validated before its original signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<Work>,
 }
 
 fn beacon_epoch_from_calldata(input: &[u8]) -> Result<u64> {
@@ -299,6 +305,14 @@ fn receipt_location(receipt: &Value, expected_hash: B256) -> Result<(u64, B256)>
     Ok((height, block_hash))
 }
 
+struct WorkSnapshot {
+    block: B256,
+    observed: Instant,
+    timestamp: u64,
+    beneficiary: Address,
+    work: Option<Work>,
+}
+
 pub struct Client {
     pub cancelled: Arc<AtomicBool>,
     pub manifest: Manifest,
@@ -308,7 +322,13 @@ pub struct Client {
     pub journal: PathBuf,
     pub receipts: PathBuf,
     head: Mutex<(u64, Instant)>,
+    native_head: Mutex<(u64, Instant)>,
     validated_work: Mutex<Option<(Work, Address)>>,
+    work_snapshot: Mutex<Option<WorkSnapshot>>,
+    proof_limit: Mutex<U256>,
+    pub pipeline: Mutex<Value>,
+    pub observer: Mutex<Option<crate::Emit>>,
+    writer: Mutex<()>,
     pub transactions: Mutex<Vec<Value>>,
     pub fees: Mutex<crate::fees::Fees>,
 }
@@ -343,7 +363,13 @@ impl Client {
             journal,
             receipts,
             head: Mutex::new((0, Instant::now())),
+            native_head: Mutex::new((0, Instant::now())),
             validated_work: Mutex::new(None),
+            work_snapshot: Mutex::new(None),
+            proof_limit: Mutex::new(U256::ZERO),
+            pipeline: Mutex::new(json!({"status":"idle","pending":0})),
+            observer: Mutex::new(None),
+            writer: Mutex::new(()),
             transactions: Mutex::new(Vec::new()),
             fees: Mutex::new(crate::fees::Fees::default()),
         });
@@ -358,7 +384,7 @@ impl Client {
                 native_rpc.native()?["chain_id"] == expected,
                 "Wrong VEX native network"
             );
-        } else {
+        } else if self.manifest.mode == "local" {
             let version = self.read.request("web3_clientVersion", json!([]))?;
             ensure!(
                 version
@@ -381,7 +407,7 @@ impl Client {
             let head = info["head_block_num"]
                 .as_u64()
                 .context("Native head is unavailable")?;
-            let mut previous = self.head.lock().unwrap();
+            let mut previous = self.native_head.lock().unwrap();
             if previous.0 != head {
                 *previous = (head, Instant::now());
             }
@@ -392,20 +418,13 @@ impl Client {
         }
         // EVM-only operation verifies identity and tracks the EVM head itself.
         // A frozen relay must not silently authorize further submissions.
-        if self.native.is_none() {
+        {
             verify_evm_chain(&self.read, self.manifest.chain_id)?;
             let value = self.read.request("eth_blockNumber", json!([]))?;
             let height = abi::quantity(value.as_str().context("Invalid EVM block number")?)?;
             ensure!(height <= U256::from(u64::MAX), "EVM block number overflow");
             let height = height.to::<u64>();
-            let mut previous = self.head.lock().unwrap();
-            if previous.0 != height {
-                *previous = (height, Instant::now());
-            }
-            ensure!(
-                previous.1.elapsed() < Duration::from_secs(60),
-                "EVM head is stalled"
-            );
+            self.observe_head(height)?;
         }
         Ok(())
     }
@@ -541,6 +560,13 @@ impl Client {
             revision == self.number(d.ledger, "moduleGeneration()")?,
             "Upgrade checkpoint mismatch"
         );
+        let limit = self.number(d.ledger, "MAX_PROOFS_PER_EPOCH()")?;
+        ensure!(
+            limit > U256::ZERO && limit <= U256::from(u32::MAX),
+            "Unsupported proof limit"
+        );
+        *self.proof_limit.lock().unwrap() = limit;
+        *self.work_snapshot.lock().unwrap() = None;
         Ok(revision)
     }
     pub fn block(&self) -> Result<Value> {
@@ -560,59 +586,127 @@ impl Client {
         ensure!(n < (U256::from(1) << 48), "Epoch is out of range");
         Ok(n.try_into()?)
     }
-    pub fn work(&self, beneficiary: Address) -> Result<Option<Work>> {
-        let d = &self.manifest;
-        let now = self.now()?;
-        if now < d.launch_time {
-            return Ok(None);
+    pub fn work_deadline(&self) -> Option<Instant> {
+        self.work_snapshot.lock().unwrap().as_ref().and_then(|s| {
+            s.work.as_ref().map(|w| {
+                s.observed
+                    + Duration::from_secs(
+                        w.end_time
+                            .saturating_sub(INCLUSION_MARGIN_SECONDS)
+                            .saturating_sub(s.timestamp)
+                            .min(5),
+                    )
+            })
+        })
+    }
+    fn observe_head(&self, height: u64) -> Result<()> {
+        let mut previous = self.head.lock().unwrap();
+        if previous.0 != height {
+            *previous = (height, Instant::now());
         }
-        if self.number(d.ledger, "admissionPaused()")? != U256::ZERO {
+        ensure!(
+            previous.1.elapsed() < Duration::from_secs(60),
+            "EVM head is stalled"
+        );
+        Ok(())
+    }
+    pub fn work(&self, beneficiary: Address) -> Result<Option<Work>> {
+        let block = self.block()?;
+        let height = block["number"].as_str().context("Block height missing")?;
+        self.observe_head(abi::quantity(height)?.try_into()?)?;
+        let hash: B256 = block["hash"]
+            .as_str()
+            .context("Block hash missing")?
+            .parse()?;
+        if let Some(snapshot) = self.work_snapshot.lock().unwrap().as_ref()
+            && snapshot.block == hash
+            && snapshot.beneficiary == beneficiary
+        {
+            return Ok(snapshot.work.clone());
+        }
+        let now: u64 = abi::quantity(
+            block["timestamp"]
+                .as_str()
+                .context("Block timestamp missing")?,
+        )?
+        .try_into()?;
+        let observed = Instant::now();
+        let work = self.work_at(beneficiary, now, height)?;
+        *self.work_snapshot.lock().unwrap() = Some(WorkSnapshot {
+            block: hash,
+            observed,
+            timestamp: now,
+            beneficiary,
+            work: work.clone(),
+        });
+        Ok(work)
+    }
+    fn call_at(
+        &self,
+        to: Address,
+        signature: &str,
+        words: &[B256],
+        height: &str,
+    ) -> Result<String> {
+        let result = self.read.request(
+            "eth_call",
+            json!([{"to":to,"data":abi::call(signature, words)},height]),
+        )?;
+        Ok(result.as_str().context("Invalid ABI response")?.to_owned())
+    }
+    fn work_at(&self, beneficiary: Address, now: u64, height: &str) -> Result<Option<Work>> {
+        let d = &self.manifest;
+        if now < d.launch_time {
             return Ok(None);
         }
         let epoch = (now - d.launch_time) / d.epoch_seconds;
         let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
-        // Stop producing work before the relay inclusion safety margin. This
-        // prevents workers from filling the proof queue with candidates that
-        // cannot be included before the epoch closes.
         if !mining_window_open(now, end_time) {
             return Ok(None);
         }
-        let generation = self.number(d.ledger, "moduleGeneration()")?;
-        // eth_call is executed at "latest". A block may cross the 60-second
-        // boundary after epochNow() was read but before targetForEpoch() is
-        // evaluated. The Ledger correctly reverts InvalidEpoch() in that case.
-        // Discard only that verified epoch transition; do NOT suppress an
-        // InvalidEpoch in the same epoch or any other revert.
-        let target = match self.call(
-            d.ledger,
-            "targetForEpoch(uint48)",
-            &[abi::uint(U256::from(epoch))],
-        ) {
-            Ok(result) => abi::scalar(&result)?,
-            Err(error) if is_epoch_boundary_revert(&error) => {
-                if self.epoch()? != epoch {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
+        if abi::boolean(&self.call_at(d.ledger, "admissionPaused()", &[], height)?)? {
+            return Ok(None);
+        }
+        let word = abi::uint(U256::from(epoch));
+        let info = abi::words(&self.call_at(d.ledger, "epochInfo(uint48)", &[word], height)?)?;
+        ensure!(info.len() == 10, "Invalid epoch schema");
+        let limit = *self.proof_limit.lock().unwrap();
+        ensure!(
+            limit > U256::ZERO,
+            "Verify the deployment before requesting work"
+        );
+        if abi::number(info[3]) >= limit || abi::number(info[6]) != U256::ZERO {
+            return Ok(None);
+        }
+        // This call also enforces the coordinator's workActive checkpoint.
+        // All reads use the same block, so a boundary cannot mix two epochs.
+        let target = match self.call_at(d.ledger, "targetForEpoch(uint48)", &[word], height) {
+            Ok(value) => abi::scalar(&value)?,
+            Err(error) if work_unavailable(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let seed = abi::words(&self.call(
-            d.beacon,
-            "verifiedSeed(uint48)",
-            &[abi::uint(U256::from(epoch))],
-        )?)?;
-        ensure!(seed.len() == 1, "Invalid seed response");
-        if seed[0] == B256::ZERO {
+        let generation =
+            abi::scalar(&self.call_at(d.ledger, "moduleGeneration()", &[], height)?)?;
+        // After the first proof the Ledger owns the seed. Clearing the beacon
+        // cache alone does not invalidate an already opened Ledger epoch.
+        let seed = if info[1] != B256::ZERO {
+            info[1]
+        } else {
+            let words =
+                abi::words(&self.call_at(d.beacon, "verifiedSeed(uint48)", &[word], height)?)?;
+            ensure!(words.len() == 1, "Invalid seed response");
+            words[0]
+        };
+        if seed == B256::ZERO {
             return Ok(None);
         }
         let work = Work {
-            chain_id: self.manifest.chain_id,
+            chain_id: d.chain_id,
             ledger: d.ledger,
             token: d.token,
             generation,
             epoch,
-            seed: seed[0],
+            seed,
             target,
             end_time,
         };
@@ -626,15 +720,11 @@ impl Client {
             return Ok(Some(work));
         }
         let nonce = (U256::from(1) << 128) + U256::from(7);
-        let expected = abi::words(&self.call(
+        let expected = abi::words(&self.call_at(
             d.ledger,
             "digestFor(uint48,bytes32,address,uint256)",
-            &[
-                abi::uint(U256::from(epoch)),
-                work.seed,
-                abi::address(beneficiary),
-                abi::uint(nonce),
-            ],
+            &[word, seed, abi::address(beneficiary), abi::uint(nonce)],
+            height,
         )?)?;
         ensure!(
             expected.len() == 1 && expected[0] == pow::digest(&work, beneficiary, nonce),
@@ -671,6 +761,26 @@ impl Client {
     }
     fn journal_path(&self, account: Address, nonce: u64) -> PathBuf {
         self.journal.join(format!("{account:#x}-{nonce:020}.json"))
+    }
+    pub fn pending_journals(&self, account: Address) -> Result<usize> {
+        let mut pending = 0;
+        for path in fs::read_dir(&self.journal)? {
+            let path = path?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let record: Journal = serde_json::from_slice(&fs::read(path)?)?;
+                ensure!(
+                    record.account == account && record.chain_id == self.manifest.chain_id,
+                    "Journal network or account mismatch"
+                );
+                if !matches!(
+                    record.state.as_str(),
+                    "confirmed" | "superseded" | "replaced"
+                ) {
+                    pending += 1;
+                }
+            }
+        }
+        Ok(pending)
     }
     fn write_journal(&self, record: &Journal) -> Result<()> {
         storage::atomic_json(&self.journal_path(record.account, record.nonce), record)
@@ -720,6 +830,8 @@ impl Client {
     }
     pub fn receipt(&self, hash: B256, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
+        let mut health_at = Instant::now();
+        let mut delay = Duration::from_millis(400);
         while Instant::now() < deadline {
             if let Ok(receipt) = self
                 .read
@@ -728,8 +840,15 @@ impl Client {
             {
                 return Ok(receipt);
             }
-            self.health()?;
-            thread::sleep(Duration::from_millis(400));
+            if self.cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if Instant::now() >= health_at {
+                self.health()?;
+                health_at = Instant::now() + Duration::from_secs(4);
+            }
+            thread::sleep(delay);
+            delay = (delay + Duration::from_millis(200)).min(Duration::from_millis(1500));
         }
         bail!("Receipt pending; retain the signed transaction journal")
     }
@@ -904,6 +1023,15 @@ impl Client {
                     !epoch_closed && !admission_paused && !seed_verified,
                     "Mining context is unavailable; retain the journal until its nonce can be reconciled"
                 );
+                if !is_beacon {
+                    let expected = entry.work.as_ref().context(
+                        "Proof journal has no work context; retain it until its receipt or closed epoch can be reconciled"
+                    )?;
+                    ensure!(
+                        expected.epoch == epoch && self.work(account)?.as_ref() == Some(expected),
+                        "Signed proof work has changed; retain the journal without rebroadcasting"
+                    );
+                }
             }
             if entry.state == "prepared" && matches!(entry.label.as_str(), "claim" | "seal") {
                 ensure!(
@@ -916,6 +1044,16 @@ impl Client {
                 entry.hash,
                 U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas()),
             )?;
+            ensure!(
+                self.nonce(account, "pending")? == entry.nonce
+                    && self
+                        .read
+                        .request("eth_getTransactionByHash", json!([entry.hash]))?
+                        .is_null(),
+                "Transaction is pending; retain the signed journal without rebroadcasting"
+            );
+            self.identity()?;
+            ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
             let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([entry.raw]));
@@ -938,12 +1076,54 @@ impl Client {
         data: String,
         expected: Option<&Work>,
     ) -> Result<Value> {
+        let _writer = self.writer.lock().unwrap();
+        self.transaction_phase("preflight", label, None);
+        let result = self.send_inner(signer, label, to, data, expected);
+        if result.is_ok() {
+            self.transaction_phase("idle", label, None);
+        } else {
+            let mut pipeline = self.pipeline.lock().unwrap();
+            pipeline["status"] = json!(if pipeline["pending"] == 1 {
+                "uncertain"
+            } else {
+                "idle"
+            });
+        }
+        result
+    }
+    fn transaction_phase(&self, status: &str, label: &str, hash: Option<B256>) {
+        let mut pipeline = self.pipeline.lock().unwrap();
+        let hash = if status == "preflight" && pipeline["pending"] == 1 {
+            pipeline["hash"]
+                .as_str()
+                .and_then(|v| v.parse::<B256>().ok())
+                .or(hash)
+        } else {
+            hash
+        };
+        let data =
+            json!({"status":status,"label":label,"hash":hash,"pending":u8::from(hash.is_some())});
+        *pipeline = data.clone();
+        drop(pipeline);
+        if let Some(emit) = self.observer.lock().unwrap().clone() {
+            emit(json!({"event":"transaction","data":data}));
+        }
+    }
+    fn send_inner(
+        &self,
+        signer: &PrivateKeySigner,
+        label: &str,
+        to: Address,
+        data: String,
+        expected: Option<&Work>,
+    ) -> Result<Value> {
         ensure!(!self.cancelled.load(Ordering::SeqCst), "Signing stopped");
         ensure!(
             [self.manifest.ledger, self.manifest.beacon].contains(&to),
             "Unexpected transaction recipient"
         );
         self.reconcile(signer.address(), false)?;
+        self.pipeline.lock().unwrap()["pending"] = json!(0);
         self.health()?;
         self.identity()?;
         self.implementations()?;
@@ -969,9 +1149,11 @@ impl Client {
         if let Some(work) = expected {
             ensure!(
                 generation == work.generation
-                    && self.epoch()? == work.epoch
-                    && mining_window_open(self.now()?, work.end_time),
-                "STALE_WORK: epoch or generation changed"
+                    && self.work(signer.address())?.as_ref() == Some(work)
+                    && self
+                        .work_deadline()
+                        .is_some_and(|deadline| Instant::now() < deadline),
+                "STALE_WORK: epoch, seed, target, generation or admission changed"
             );
         }
         let account = signer.address();
@@ -1038,12 +1220,26 @@ impl Client {
             label: label.into(),
             receipt: None,
             replacement: None,
+            work: expected.cloned(),
         };
         self.write_journal(&record)?;
         let started = Instant::now();
         let mut result = None;
         for attempt in 0..2 {
+            ensure!(
+                !self.cancelled.load(Ordering::SeqCst),
+                "Signing stopped; retain the signed journal"
+            );
             if attempt != 0 {
+                ensure!(
+                    self.nonce(account, "latest")? == nonce
+                        && self.nonce(account, "pending")? == nonce
+                        && self
+                            .read
+                            .request("eth_getTransactionByHash", json!([hash]))?
+                            .is_null(),
+                    "Transaction outcome is uncertain; reconcile the retained journal before retrying"
+                );
                 self.identity()?;
                 self.implementations()?;
                 self.verify_owner()?;
@@ -1072,9 +1268,11 @@ impl Client {
                     );
                 }
             }
+            self.transaction_phase("tx-submission", label, Some(hash));
             let broadcast = self
                 .submit
                 .request("eth_sendRawTransaction", json!([record.raw]));
+            self.transaction_phase("receipt-tracking", label, Some(hash));
             match self.receipt(hash, Duration::from_secs(35)) {
                 Ok(value) => {
                     result = Some(value);
@@ -1116,6 +1314,136 @@ impl Client {
 mod tests {
     use super::*;
     const GAS_PRICE: u128 = 150_000_000_000;
+
+    fn fixture_manifest() -> Manifest {
+        serde_json::from_value(json!({"schema":"zoru-mainnet-suite-1","chainId":CHAIN,"mode":"mainnet",
+            "token":Address::repeat_byte(1),"ledger":Address::repeat_byte(2),"engine":Address::repeat_byte(3),
+            "beacon":Address::repeat_byte(4),"admin":Address::repeat_byte(5),"owner":Address::repeat_byte(6),
+            "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
+            "drandChainHash":DRAND_HASH,"runtimeCodeHashes":{},"approvedImplementationCodeHashes":{},"manifestSha256":"fixture"})).unwrap()
+    }
+    fn encoded(words: &[B256]) -> Value {
+        json!(format!(
+            "0x{}",
+            words.iter().map(hex::encode).collect::<String>()
+        ))
+    }
+    #[test]
+    fn evm_only_mainnet_identity_needs_no_native_endpoint_or_anvil_brand() {
+        for chain in [CHAIN, 1] {
+            let (url, server) =
+                crate::rpc::tests::sequence(vec![("eth_chainId", json!(format!("0x{chain:x}")))]);
+            let dir = tempfile::tempdir().unwrap();
+            let result = Client::new(
+                fixture_manifest(),
+                &url,
+                &url,
+                None,
+                dir.path().join("j"),
+                dir.path().join("r"),
+            );
+            assert_eq!(result.is_ok(), chain == CHAIN);
+            if let Ok(c) = result {
+                *c.head.lock().unwrap() = (10, Instant::now() - Duration::from_secs(61));
+                assert!(
+                    c.observe_head(10)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("stalled")
+                );
+                assert!(c.observe_head(11).is_ok());
+            }
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn opened_epoch_uses_ledger_seed_and_caches_only_the_same_block() {
+        let d = fixture_manifest();
+        let beneficiary = Address::repeat_byte(7);
+        let work = Work {
+            chain_id: CHAIN,
+            ledger: d.ledger,
+            token: d.token,
+            generation: U256::from(7),
+            epoch: 1,
+            seed: B256::repeat_byte(8),
+            target: U256::MAX >> 16,
+            end_time: 121,
+        };
+        let block = json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"});
+        let mut info = [B256::ZERO; 10];
+        info[0] = abi::uint(work.target);
+        info[1] = work.seed;
+        info[3] = abi::uint(U256::from(1));
+        info[8] = abi::uint(work.generation);
+        let (url, server) = crate::rpc::tests::sequence(vec![
+            ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
+            ("eth_getBlockByNumber", block.clone()),
+            ("eth_call", encoded(&[B256::ZERO])),
+            ("eth_call", encoded(&info)),
+            ("eth_call", encoded(&[abi::uint(work.target)])),
+            ("eth_call", encoded(&[abi::uint(work.generation)])),
+            (
+                "eth_call",
+                encoded(&[pow::digest(
+                    &work,
+                    beneficiary,
+                    (U256::from(1) << 128) + U256::from(7),
+                )]),
+            ),
+            ("eth_getBlockByNumber", block),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let c = Client::new(
+            d,
+            &url,
+            &url,
+            None,
+            dir.path().join("j"),
+            dir.path().join("r"),
+        )
+        .unwrap();
+        *c.proof_limit.lock().unwrap() = U256::from(u32::MAX);
+        assert_eq!(c.work(beneficiary).unwrap(), Some(work.clone()));
+        assert_eq!(c.work(beneficiary).unwrap(), Some(work));
+        assert_eq!(
+            c.read.request_count(),
+            8,
+            "the second read must use the block cache"
+        );
+        assert!(c.work_deadline().unwrap() <= Instant::now() + Duration::from_secs(5));
+        server.join().unwrap();
+    }
+    #[test]
+    fn proof_limit_and_sealed_epochs_do_not_produce_hashing_work() {
+        for sealed in [false, true] {
+            let mut info = [B256::ZERO; 10];
+            info[3] = abi::uint(U256::from(if sealed { 0 } else { 5 }));
+            info[6] = abi::uint(U256::from(u8::from(sealed)));
+            let (url, server) = crate::rpc::tests::sequence(vec![
+                ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
+                (
+                    "eth_getBlockByNumber",
+                    json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"}),
+                ),
+                ("eth_call", encoded(&[B256::ZERO])),
+                ("eth_call", encoded(&info)),
+            ]);
+            let dir = tempfile::tempdir().unwrap();
+            let c = Client::new(
+                fixture_manifest(),
+                &url,
+                &url,
+                None,
+                dir.path().join("j"),
+                dir.path().join("r"),
+            )
+            .unwrap();
+            *c.proof_limit.lock().unwrap() = U256::from(5);
+            assert!(c.work(Address::repeat_byte(7)).unwrap().is_none());
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn network_modes_require_their_exact_chain_and_native_identity() {
@@ -1178,6 +1506,7 @@ mod tests {
                 label: "publish-drand".into(),
                 receipt: None,
                 replacement: None,
+                work: None,
             },
             beacon,
         )
@@ -1246,6 +1575,7 @@ mod tests {
             label: "publish-drand".into(),
             receipt: None,
             replacement: None,
+            work: None,
         };
         assert!(obsolete_mining_journal(&entry, 5, 5, false, true, false));
         assert!(obsolete_mining_journal(&entry, 5, 5, false, false, true));
@@ -1314,29 +1644,6 @@ mod tests {
         assert!(!mining_window_open(cutoff + 1, end));
         assert!(!mining_window_open(end, end));
         assert!(!mining_window_open(u64::MAX, end));
-    }
-
-    #[test]
-    fn only_exact_invalid_epoch_selector_is_a_boundary_candidate() {
-        assert!(is_epoch_boundary_revert(&anyhow::anyhow!(
-            "eth_call: RPC error 3 0xd5b25b63"
-        )));
-        for unrelated in [
-            "eth_call: RPC error 3 0x09bde339",
-            "eth_call: RPC error 3 0xd5b25b64",
-            "eth_estimateGas: RPC error 3 0xd5b25b63",
-            "eth_call: RPC transport unavailable",
-        ] {
-            assert!(!is_epoch_boundary_revert(&anyhow::anyhow!("{unrelated}")));
-        }
-    }
-
-    #[test]
-    fn epoch_boundary_matches_deployed_contract_signature() {
-        assert_eq!(
-            &format!("{:#x}", abi::keccak("InvalidEpoch()".as_bytes()))[..10],
-            "0xd5b25b63"
-        );
     }
 
     #[test]

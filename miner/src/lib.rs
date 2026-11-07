@@ -1,4 +1,5 @@
 pub mod abi;
+pub type Emit = std::sync::Arc<dyn Fn(serde_json::Value) + Send + Sync>;
 pub mod fees;
 pub mod history;
 pub mod pow;

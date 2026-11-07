@@ -2,7 +2,7 @@ use anyhow::{Result, bail, ensure};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::Read,
     sync::{
         Mutex,
@@ -19,6 +19,8 @@ pub struct Rpc {
     interval: Duration,
     id: AtomicU64,
     requests: AtomicU64,
+    errors: AtomicU64,
+    methods: Mutex<BTreeMap<String, u64>>,
     endpoints: Vec<String>,
     active: AtomicUsize,
     expected_chain: Option<u64>,
@@ -53,6 +55,8 @@ impl Rpc {
             interval,
             id: AtomicU64::new(1),
             requests: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            methods: Mutex::new(BTreeMap::new()),
             endpoints: vec![url.into()],
             active: AtomicUsize::new(0),
             expected_chain: None,
@@ -127,10 +131,19 @@ impl Rpc {
         if times.len() > 2048 {
             times.pop_front();
         }
+        if result.is_err() {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
     fn post(&self, url: &str, method: &str, params: &Value) -> Result<Value> {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        *self
+            .methods
+            .lock()
+            .unwrap()
+            .entry(method.to_owned())
+            .or_default() += 1;
         let id = self.id.fetch_add(1, Ordering::Relaxed);
         let response = self
             .http
@@ -213,6 +226,12 @@ impl Rpc {
     pub fn request_count(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
     }
+    pub fn metrics(&self) -> Value {
+        let times = self.latencies.lock().unwrap();
+        json!({"requests":self.request_count(),"errors":self.errors.load(Ordering::Relaxed),
+            "failovers":self.failover_count(),"methods":*self.methods.lock().unwrap(),
+            "meanLatencyMilliseconds":if times.is_empty(){None}else{Some(times.iter().sum::<f64>() / times.len() as f64 * 1000.0)}})
+    }
     pub fn active_url(&self) -> &str {
         &self.endpoints[self.active.load(Ordering::Relaxed)]
     }
@@ -227,7 +246,7 @@ fn transport_failure(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{io::Write, net::TcpListener};
 
@@ -341,7 +360,9 @@ mod tests {
         assert!(u64::from_str_radix(height.as_str().unwrap().trim_start_matches("0x"), 16).is_ok());
     }
 
-    fn sequence(responses: Vec<(&'static str, Value)>) -> (String, thread::JoinHandle<()>) {
+    pub(crate) fn sequence(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
