@@ -304,7 +304,7 @@ pub struct Client {
     pub manifest: Manifest,
     pub read: Rpc,
     pub submit: Rpc,
-    pub native: Rpc,
+    pub native: Option<Rpc>,
     pub journal: PathBuf,
     pub receipts: PathBuf,
     head: Mutex<(u64, Instant)>,
@@ -317,7 +317,7 @@ impl Client {
         manifest: Manifest,
         read: &str,
         submit: &str,
-        native: &str,
+        native: Option<&str>,
         journal: PathBuf,
         receipts: PathBuf,
     ) -> Result<Arc<Self>> {
@@ -337,7 +337,9 @@ impl Client {
             manifest,
             read: read_rpc,
             submit: submit_rpc,
-            native: Rpc::new(native, Duration::from_millis(80))?,
+            native: native
+                .map(|url| Rpc::new(url, Duration::from_millis(80)))
+                .transpose()?,
             journal,
             receipts,
             head: Mutex::new((0, Instant::now())),
@@ -351,9 +353,9 @@ impl Client {
     pub fn identity(&self) -> Result<()> {
         verify_evm_chain(&self.read, self.manifest.chain_id)?;
         let native = network_identity(&self.manifest.mode, self.manifest.chain_id)?;
-        if let Some(expected) = native {
+        if let (Some(expected), Some(native_rpc)) = (native, self.native.as_ref()) {
             ensure!(
-                self.native.native()?["chain_id"] == expected,
+                native_rpc.native()?["chain_id"] == expected,
                 "Wrong VEX native network"
             );
         } else {
@@ -370,8 +372,11 @@ impl Client {
         Ok(())
     }
     pub fn health(&self) -> Result<()> {
-        if let Some(expected) = network_identity(&self.manifest.mode, self.manifest.chain_id)? {
-            let info = self.native.native()?;
+        if let (Some(expected), Some(native_rpc)) = (
+            network_identity(&self.manifest.mode, self.manifest.chain_id)?,
+            self.native.as_ref(),
+        ) {
+            let info = native_rpc.native()?;
             ensure!(info["chain_id"] == expected, "Wrong VEX native network");
             let head = info["head_block_num"]
                 .as_u64()
@@ -383,6 +388,23 @@ impl Client {
             ensure!(
                 previous.1.elapsed() < Duration::from_secs(10),
                 "Native head is stalled"
+            );
+        }
+        // EVM-only operation verifies identity and tracks the EVM head itself.
+        // A frozen relay must not silently authorize further submissions.
+        if self.native.is_none() {
+            verify_evm_chain(&self.read, self.manifest.chain_id)?;
+            let value = self.read.request("eth_blockNumber", json!([]))?;
+            let height = abi::quantity(value.as_str().context("Invalid EVM block number")?)?;
+            ensure!(height <= U256::from(u64::MAX), "EVM block number overflow");
+            let height = height.to::<u64>();
+            let mut previous = self.head.lock().unwrap();
+            if previous.0 != height {
+                *previous = (height, Instant::now());
+            }
+            ensure!(
+                previous.1.elapsed() < Duration::from_secs(60),
+                "EVM head is stalled"
             );
         }
         Ok(())

@@ -45,7 +45,7 @@ struct Connection {
     submit: Option<String>,
     /// Native Vexanium endpoint used to verify network identity and health.
     #[arg(long)]
-    native: String,
+    native: Option<String>,
     /// Encrypted Web3 version 3 wallet; omitted for read-only inspection.
     #[arg(long)]
     wallet: Option<PathBuf>,
@@ -475,8 +475,6 @@ mod tests {
             "deployment.json",
             "--rpc",
             "https://vexascan.com/rpc",
-            "--native",
-            "https://vexascan.com:8443",
             "--state-dir",
             "state",
         ])
@@ -484,6 +482,7 @@ mod tests {
         let Command::Mine { connection, .. } = cli.command else {
             panic!("expected mine")
         };
+        assert!(connection.native.is_none());
         assert_eq!(connection.options().read, "https://vexascan.com/rpc");
         assert_eq!(connection.options().submit, "https://vexascan.com/rpc");
     }

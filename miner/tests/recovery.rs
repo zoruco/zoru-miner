@@ -35,7 +35,7 @@ fn rpc_fee_quote_is_signed_and_total_fee_budget_blocks_excessive_quotes() {
         manifest,
         options["read"].as_str().unwrap(),
         options["submit"].as_str().unwrap(),
-        "http://127.0.0.1:1",
+        Some("http://127.0.0.1:1"),
         dir.path().join("journal"),
         dir.path().join("receipts"),
     )
@@ -165,7 +165,7 @@ fn signed_retry_restart_reorg_and_replacement() {
         manifest,
         options["read"].as_str().unwrap(),
         options["submit"].as_str().unwrap(),
-        "http://127.0.0.1:1",
+        Some("http://127.0.0.1:1"),
         dir.path().join("journal"),
         dir.path().join("receipts"),
     )
@@ -178,7 +178,7 @@ fn signed_retry_restart_reorg_and_replacement() {
         wrong_owner,
         options["read"].as_str().unwrap(),
         options["submit"].as_str().unwrap(),
-        "http://127.0.0.1:1",
+        Some("http://127.0.0.1:1"),
         dir.path().join("wrong-owner-journal"),
         dir.path().join("wrong-owner-receipts"),
     )
