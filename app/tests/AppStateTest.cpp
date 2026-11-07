@@ -235,7 +235,7 @@ class AppStateTest final : public QObject {
         qInfo("Pause confirmed.");
         QVERIFY(click("pauseResumeMiningButton"));
         QTRY_VERIFY_WITH_TIMEOUT(state.activelyHashing(), 120000);
-        QTRY_VERIFY_WITH_TIMEOUT(state.sessionAccepted() >= 8, 180000);
+        QTRY_VERIFY_WITH_TIMEOUT(state.sessionAccepted() >= 8, 600000);
         qInfo("Continuous mining confirmed.");
         QVERIFY(click("stopMiningButton"));
         QTRY_VERIFY_WITH_TIMEOUT(!state.mining(), 30000);

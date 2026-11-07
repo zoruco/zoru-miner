@@ -65,6 +65,9 @@ def main():
                     state = json.loads(control.read_text()) if control.exists() else {}
                 if state.get('outage'):
                     raise ConnectionError('Simulated relay outage')
+                delay = state.get('delayCall', {})
+                if method == 'eth_call' and body['params'][0].get('data') == delay.get('data'):
+                    time.sleep(min(10, max(0, delay.get('milliseconds', 0) / 1000)))
                 if method == 'eth_getTransactionReceipt' and state.get('delayReceiptsUntil', 0) > time.time():
                     response = {'jsonrpc': '2.0', 'id': body['id'], 'result': None}
                 elif state.get('frozenBlock') and method == 'eth_getBlockByNumber' and body['params'][0] == 'latest':

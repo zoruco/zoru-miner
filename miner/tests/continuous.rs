@@ -112,7 +112,10 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
             .contains("anvil")
     );
     let control = PathBuf::from(cfg["faultControl"].as_str().unwrap());
-    storage::atomic_json(&control, &json!({})).unwrap();
+    let slow_inspection = json!({"data":abi::call("totalProofs()", &[]),"milliseconds":10_000});
+    storage::atomic_json(&control, &json!({"delayCall":slow_inspection})).unwrap();
+    let inspections = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let inspection_events = inspections.clone();
     let states = Arc::new(Mutex::new(Vec::new()));
     let observed = states.clone();
     let delayed_proof = Arc::new(AtomicBool::new(false));
@@ -122,6 +125,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     let tx_hash = Arc::new(Mutex::new(None::<B256>));
     let submitted = tx_hash.clone();
     let controls = control.clone();
+    let slow_read = slow_inspection.clone();
     let directory = PathBuf::from(cfg["report"].as_str().unwrap())
         .parent()
         .unwrap()
@@ -133,6 +137,9 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         wallet:Some(PathBuf::from(cfg["wallet"].as_str().unwrap())),expected_wallet:None,observer:None,
         fee_budget:None,sync_on_connect:true,state_dir:directory.clone(),
     },Zeroizing::new(cfg["password"].as_str().unwrap().into()),Arc::new(move |event| {
+        if event["event"]=="inspection" {
+            inspection_events.lock().unwrap().push(event["data"].clone());
+        }
         if event["event"]=="state" {
             let mut states = observed.lock().unwrap();
             states.push(event["data"].clone());
@@ -144,7 +151,9 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
             let first = if proof { !delay_proof.swap(true,Ordering::SeqCst) }
                 else if claim { !delay_claim.swap(true,Ordering::SeqCst) } else {false};
             if first {
-                storage::atomic_json(&controls,&json!({"delayReceiptsUntil":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()+6.0})).unwrap();
+                let mut faults = json!({"delayReceiptsUntil":SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()+6.0});
+                if proof { faults["delayCall"] = slow_read.clone(); }
+                storage::atomic_json(&controls,&faults).unwrap();
                 if proof { *submitted.lock().unwrap()=event["data"]["hash"].as_str().unwrap().parse().ok(); }
             }
         }
@@ -239,6 +248,21 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     record("proof", &result);
     assert_eq!(result["accepted"], 2, "{result}");
     assert_eq!(result["rejected"], 0, "{result}");
+    assert_eq!(
+        result["errors"],
+        json!([]),
+        "Slow inspection must not mix proof heights: {result}"
+    );
+    assert!(
+        inspections
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|snapshot| snapshot["myRewardsHistoryComplete"] == false
+                && snapshot["myUnclaimedBaseUnits"].is_null()),
+        "Concurrent history changes must leave personal totals unavailable until a consistent snapshot"
+    );
+    storage::atomic_json(&control, &json!({})).unwrap();
     assert!(
         progressed(&states.lock().unwrap(), "mined-proof"),
         "hash count must increase while a proof receipt is delayed"

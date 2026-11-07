@@ -470,6 +470,7 @@ impl Session {
     }
     pub fn inspect(&self) -> Result<Value> {
         ensure!(!self.stop.load(Ordering::Relaxed), "Inspection stopped");
+        let history_revision = self.history.revision();
         let c = &self.client;
         let d = &c.manifest;
         let inspected_at = Instant::now();
@@ -600,12 +601,18 @@ impl Session {
             let proofs = self.history.pending(10_001)?;
             let head: u64 = int(&block["number"])?.try_into()?;
             let synced_at = self.history.cursor()?.unwrap_or(0);
-            let complete = proofs.len() <= 10_000
+            let mut complete = proofs.len() <= 10_000
                 && synced_at >= head.saturating_sub(crate::protocol::REORG_WINDOW);
             let mut cached_epochs = std::collections::BTreeMap::new();
             let mut my_pending = U256::ZERO;
             let mut my_unclaimed = U256::ZERO;
             for proof in proofs.iter().take(10_000).filter(|p| p.canonical) {
+                // Receipt processing can index a new proof after this read's
+                // block was pinned. Never combine it with older epoch counts.
+                if proof.block > head {
+                    complete = false;
+                    continue;
+                }
                 let index = proof.index_plus_one;
                 let epoch = if let Some(value) = cached_epochs.get(&proof.epoch) {
                     *value
@@ -627,7 +634,14 @@ impl Session {
                     cached_epochs.insert(proof.epoch, value);
                     value
                 };
-                let reward = crate::rewards::proof_reward(epoch.0, epoch.1, index)?;
+                let reward = match crate::rewards::proof_reward(epoch.0, epoch.1, index) {
+                    Ok(reward) => reward,
+                    Err(_) if self.history.revision() != history_revision => {
+                        complete = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if epoch.2 {
                     my_unclaimed = my_unclaimed
                         .checked_add(reward)
@@ -642,18 +656,36 @@ impl Session {
             data["myPendingBaseUnits"] = json!(my_pending.to_string());
             data["myUnclaimedBaseUnits"] = json!(my_unclaimed.to_string());
             data["myClaimedBaseUnits"] = json!(my_claimed.to_string());
-            data["myRewardsHistoryComplete"] = json!(complete);
             data["myPendingProofsCounted"] = json!(proofs.len().min(10_000));
             data["myProofCount"] = json!(self.history.raw_count()?.to_string());
             data["myClaimedProofs"] = json!(self.history.claimed_count()?.to_string());
             let mut rows = Vec::new();
             for proof in self.history.latest(100)? {
+                if proof.block > head {
+                    continue;
+                }
                 let mut row = serde_json::to_value(&proof)?;
                 row["epochStart"] =
                     json!((d.launch_time + proof.epoch * d.epoch_seconds).to_string());
                 rows.push(row);
             }
             data["proofs"] = json!(rows);
+            complete &= self.history.snapshot_matches(history_revision, head)?;
+            data["myRewardsHistoryComplete"] = json!(complete);
+            if !complete {
+                // A concurrent acceptance/claim is reflected on the next
+                // snapshot. Do not publish mixed-height personal totals.
+                for field in [
+                    "myPendingBaseUnits",
+                    "myUnclaimedBaseUnits",
+                    "myClaimedBaseUnits",
+                    "myProofCount",
+                    "myClaimedProofs",
+                    "myPendingProofsCounted",
+                ] {
+                    data[field] = Value::Null;
+                }
+            }
         }
         let canonical = c
             .read

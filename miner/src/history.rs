@@ -39,6 +39,21 @@ impl History {
             params![format!("{:#x}",proof.digest),if !proof.canonical{2}else if proof.claimed{1}else{0},serde_json::to_string(proof)?])?;
         Ok(())
     }
+    pub fn revision(&self) -> u64 {
+        self.db.lock().unwrap().total_changes()
+    }
+    pub fn snapshot_matches(&self, revision: u64, height: u64) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        if db.total_changes() != revision {
+            return Ok(false);
+        }
+        let ahead: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM proofs WHERE status!=2 AND (json_extract(data,'$.block')>?1 OR json_extract(data,'$.claim_block')>?1))",
+            [height],
+            |row| row.get(0),
+        )?;
+        Ok(!ahead)
+    }
     pub fn get(&self, digest: B256) -> Result<Option<Proof>> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT data FROM proofs WHERE digest=?1")?;
@@ -158,4 +173,49 @@ pub fn proof_record(log: &Value) -> Result<Proof> {
         claim_block: None,
         index_plus_one: abi::number(data[0]) + U256::from(1),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_reject_concurrent_writes_and_future_proofs_or_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = History::open(&directory.path().join("history.sqlite")).unwrap();
+        let initial = history.revision();
+        let mut proof = Proof {
+            digest: B256::repeat_byte(1),
+            epoch: 1,
+            generation: U256::from(1),
+            hash: B256::repeat_byte(2),
+            block: 10,
+            claimed: false,
+            reward: None,
+            canonical: true,
+            claim_block: None,
+            index_plus_one: U256::from(1),
+        };
+        history.put(&proof).unwrap();
+        assert!(!history.snapshot_matches(initial, 10).unwrap());
+        let accepted = history.revision();
+        assert!(!history.snapshot_matches(accepted, 9).unwrap());
+        assert!(history.snapshot_matches(accepted, 10).unwrap());
+        history.pending(10).unwrap();
+        history.paid().unwrap();
+        assert_eq!(
+            history.revision(),
+            accepted,
+            "Reads do not invalidate a snapshot"
+        );
+
+        proof.claimed = true;
+        proof.reward = Some(U256::from(7));
+        proof.claim_block = Some(11);
+        history.put(&proof).unwrap();
+        assert!(!history.snapshot_matches(accepted, 11).unwrap());
+        let claimed = history.revision();
+        assert!(!history.snapshot_matches(claimed, 10).unwrap());
+        assert!(history.snapshot_matches(claimed, 11).unwrap());
+    }
 }
