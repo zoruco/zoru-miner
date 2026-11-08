@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap},
 };
 use serde_json::Value;
 use std::{
@@ -141,7 +141,7 @@ impl View {
         {
             return;
         }
-        if self.scroll > 0 {
+        if self.scroll > 0 && (self.logs || category != "FOUND") {
             self.scroll = (self.scroll + 1).min(LIMIT - 1);
         }
         self.events.push_back(MiningEvent {
@@ -156,15 +156,26 @@ impl View {
             self.events.pop_front();
         }
     }
+    fn visible_event_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| self.logs || e.category != "FOUND")
+            .count()
+    }
     fn key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Up => self.scroll = (self.scroll + 1).min(self.events.len().saturating_sub(1)),
+            KeyCode::Up => {
+                self.scroll = (self.scroll + 1).min(self.visible_event_count().saturating_sub(1))
+            }
             KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::PageUp => {
-                self.scroll = (self.scroll + 10).min(self.events.len().saturating_sub(1))
+                self.scroll = (self.scroll + 10).min(self.visible_event_count().saturating_sub(1))
             }
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Char('l' | 'L') => self.logs = !self.logs,
+            KeyCode::Char('l' | 'L') => {
+                self.logs = !self.logs;
+                self.scroll = 0;
+            }
             KeyCode::Char('r' | 'R') => self.scroll = 0,
             _ => {}
         }
@@ -177,17 +188,35 @@ impl View {
         );
         let wide = area.width >= 100;
         let compact = area.height < 28;
+        let header_height = if compact { 4 } else { 5 };
+        let metrics_height = if compact {
+            4
+        } else if wide {
+            8
+        } else {
+            11
+        };
+        let details_height = if compact {
+            5
+        } else if wide {
+            11
+        } else {
+            7
+        };
+        let available = area
+            .height
+            .saturating_sub(header_height + metrics_height + details_height + 1);
+        let activity_height = if self.logs {
+            available
+        } else {
+            available.min(14)
+        };
         let rows = Layout::vertical([
-            Constraint::Length(if compact { 4 } else { 5 }),
-            Constraint::Length(if wide || compact { 4 } else { 8 }),
-            Constraint::Length(if compact {
-                5
-            } else if wide {
-                11
-            } else {
-                7
-            }),
-            Constraint::Min(3),
+            Constraint::Length(header_height),
+            Constraint::Length(metrics_height),
+            Constraint::Length(details_height),
+            Constraint::Length(activity_height),
+            Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(area);
@@ -250,12 +279,17 @@ impl View {
         } else {
             "Syncing".into()
         };
+        let chart_height = if compact { 0 } else { 5 };
+        let card_area = Rect {
+            height: rows[1].height.saturating_sub(chart_height),
+            ..rows[1]
+        };
         let strips = Layout::vertical(if wide {
             vec![Constraint::Percentage(100)]
         } else {
             vec![Constraint::Percentage(50); 2]
         })
-        .split(rows[1]);
+        .split(card_area);
         let count = if wide { 4 } else { 2 };
         let mut cards = Vec::new();
         for strip in strips.iter() {
@@ -275,8 +309,16 @@ impl View {
             ),
             (" UNCLAIMED / ZORU ", unclaimed, GOLD),
             (
-                " HASHRATE ",
-                hashrate(s["hashesPerSecond"].as_f64().unwrap_or(0.0)),
+                if compact {
+                    " HASHRATE "
+                } else {
+                    " LOCAL HASHES "
+                },
+                if compact {
+                    hashrate(s["hashesPerSecond"].as_f64().unwrap_or(0.0))
+                } else {
+                    display(&s["hashes"])
+                },
                 CYAN,
             ),
         ]
@@ -304,24 +346,68 @@ impl View {
                 )]),
                 inner,
             );
-            if i == 3 && !ascii && inner.height >= 2 && inner.width >= 8 {
-                let data: Vec<u64> = self
-                    .rates
-                    .iter()
-                    .skip(
-                        self.rates
-                            .len()
-                            .saturating_sub(inner.width.saturating_sub(2) as usize),
-                    )
-                    .copied()
-                    .collect();
-                frame.render_widget(
-                    Sparkline::default()
-                        .data(&data)
-                        .style(Style::default().fg(CYAN)),
-                    Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
-                );
+        }
+        if !compact && rows[1].height >= 5 {
+            let chart = Rect::new(
+                rows[1].x,
+                rows[1].bottom().saturating_sub(5),
+                rows[1].width,
+                5,
+            );
+            let block = panel(" HASHRATE / HISTORY ", ascii);
+            let inner = block.inner(chart);
+            frame.render_widget(block, chart);
+            let data: Vec<u64> = self
+                .rates
+                .iter()
+                .skip(
+                    self.rates
+                        .len()
+                        .saturating_sub(inner.width.saturating_sub(2) as usize),
+                )
+                .copied()
+                .collect();
+            let peak = data.iter().copied().max().unwrap_or(0);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " {}",
+                            hashrate(s["hashesPerSecond"].as_f64().unwrap_or(0.0))
+                        ),
+                        Style::default().fg(CYAN).bold(),
+                    ),
+                    Span::styled(
+                        format!("   PEAK {}", hashrate(peak as f64)),
+                        Style::default().fg(MUTED),
+                    ),
+                ])),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let plot = Rect::new(
+                inner.right().saturating_sub(1 + data.len() as u16),
+                inner.y + 1,
+                data.len() as u16,
+                inner.height.saturating_sub(1),
+            );
+            let mut graph = Sparkline::default()
+                .data(&data)
+                .max(peak.max(1))
+                .style(Style::default().fg(CYAN));
+            if ascii {
+                graph = graph.bar_set(ratatui::symbols::bar::Set {
+                    full: "#",
+                    seven_eighths: "#",
+                    three_quarters: "*",
+                    five_eighths: "*",
+                    half: "+",
+                    three_eighths: "=",
+                    one_quarter: ":",
+                    one_eighth: ".",
+                    empty: " ",
+                });
             }
+            frame.render_widget(graph, plot);
         }
         let remaining = p["epochEndsAt"]
             .as_u64()
@@ -487,18 +573,22 @@ impl View {
                 badge(if ascii { "UD" } else { "↑↓" }, MUTED),
                 Span::styled(" Scroll  ", Style::default().fg(MUTED)),
                 badge("L", MUTED),
-                Span::styled(" Logs  ", Style::default().fg(MUTED)),
+                Span::styled(" Detail  ", Style::default().fg(MUTED)),
                 badge("R", MUTED),
                 Span::styled(" Live  / UTC", Style::default().fg(MUTED)),
             ])
         };
-        frame.render_widget(Paragraph::new(controls), rows[4]);
+        frame.render_widget(Paragraph::new(controls), rows[5]);
     }
     fn draw_events(&self, frame: &mut Frame<'_>, area: Rect, ascii: bool) {
         let visible = area.height.saturating_sub(2) as usize;
-        let end = self.events.len().saturating_sub(self.scroll);
-        let mut lines: Vec<Line<'_>> = self
+        let events: Vec<_> = self
             .events
+            .iter()
+            .filter(|e| self.logs || e.category != "FOUND")
+            .collect();
+        let end = events.len().saturating_sub(self.scroll);
+        let mut lines: Vec<Line<'_>> = events
             .iter()
             .take(end)
             .skip(end.saturating_sub(visible))
@@ -561,13 +651,18 @@ impl View {
                 Style::default().fg(MUTED),
             ));
         }
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let overflow = paragraph
+            .line_count(area.width.saturating_sub(2))
+            .saturating_sub(visible)
+            .min(u16::MAX as usize) as u16;
         frame.render_widget(
-            Paragraph::new(lines).block(
+            paragraph.scroll((overflow, 0)).block(
                 panel(
                     if self.logs {
-                        " ACTIVITY / SCROLL "
+                        " ACTIVITY / DETAIL "
                     } else {
-                        " LIVE ACTIVITY "
+                        " TRANSACTIONS / NETWORK "
                     },
                     ascii,
                 )
@@ -776,6 +871,7 @@ mod tests {
             view.push("FOUND", &format!("candidate {i}"));
         }
         assert_eq!(view.events.len(), LIMIT);
+        view.logs = true;
         let mut terminal = Terminal::new(TestBackend::new(110, 35)).unwrap();
         for (w, h) in [
             (110, 35),
@@ -827,7 +923,7 @@ mod tests {
             "currentEpoch":"13921"
         }}));
         view.push("ACCEPTED", "Proof confirmed in block 11957934");
-        for (width, height) in [(66, 32), (42, 32), (80, 24), (120, 35)] {
+        for (width, height) in [(66, 32), (66, 63), (42, 32), (80, 24), (120, 35)] {
             for ascii in [false, true] {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal.draw(|f| view.draw(f, ascii)).unwrap();
@@ -870,8 +966,17 @@ mod tests {
                 if ascii {
                     assert!(screen.is_ascii(), "ASCII mode contains Unicode: {screen}");
                 }
-                if !ascii && width == 66 && height == 32 {
-                    let graph: String = (34..65).map(|x| buffer[(x, 11)].symbol()).collect();
+                if !ascii && width == 66 && height >= 32 {
+                    for y in [13, 14] {
+                        assert!(
+                            (1..65).any(|x| buffer[(x, y)].symbol() == "█"),
+                            "Graph needs two visible rows"
+                        );
+                    }
+                    if height == 63 {
+                        assert_eq!(buffer[(0, 50)].symbol(), " ");
+                    }
+                    let graph: String = (1..65).map(|x| buffer[(x, 13)].symbol()).collect();
                     assert!(
                         !graph.chars().any(|c| c.is_ascii_alphabetic()),
                         "Graph must not retain caption text: {graph}"
@@ -910,5 +1015,32 @@ mod tests {
         assert_eq!(view.events[0].repeats, 2);
         assert_eq!(view.events[1].repeats, 1);
         assert_eq!(view.events[2].message, "Proof confirmed in block 101");
+    }
+
+    #[test]
+    fn wrapped_rpc_detail_and_latest_receipt_remain_visible() {
+        let mut view = View::default();
+        view.push("FOUND", "Valid local candidate · nonce 0x1234");
+        view.push("WARNING", "Submission response: eth_sendRawTransaction: account vex.evm has insufficient ram; needs 5995936 bytes has 5995719 bytes");
+        view.push("ACCEPTED", "Proof confirmed in block 11957934");
+        assert_eq!(view.visible_event_count(), 2);
+        let mut terminal = Terminal::new(TestBackend::new(66, 8)).unwrap();
+        terminal
+            .draw(|f| view.draw_events(f, f.area(), true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..8)
+            .map(|y| (0..66).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("5995719"),
+            "RPC reason was clipped: {screen}"
+        );
+        assert!(screen.contains("Block 11957934"));
+        assert!(!screen.contains("Nonce"));
+        view.key(KeyCode::Char('l'));
+        assert_eq!(view.visible_event_count(), 3);
+        assert_eq!(view.scroll, 0);
     }
 }

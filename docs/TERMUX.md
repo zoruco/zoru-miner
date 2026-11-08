@@ -61,14 +61,18 @@ transaction-free check use `zoru-miner-cli mine --dry-run --seconds 30`.
 Android may suspend Termux in the background; a foreground terminal and a
 Termux wake lock can help, subject to the device's battery restrictions.
 
-The dashboard uses colored status badges, balance cards and a rolling graph
-of measured hashrate. Phone screens use two columns; wider terminals show
-network and engine details side by side. `--ascii` keeps all dashboard glyphs
-ASCII and omits the graph. Uptime appears once in the session panel. The
-activity feed omits hashing and queue transitions already shown in live
-metrics, and combines identical warnings or errors into one row with an
-occurrence count. Distinct proof receipts remain separate events. Raw JSON
-output from `--plain` retains the full engine event stream.
+The dashboard uses colored status badges, compact balance cards and a
+dedicated hashrate panel with the current rate, measured peak and a two-row
+history graph. New samples arrive at the right edge. Phone screens use two columns;
+wider terminals show network and engine details side by side. `--ascii`
+uses ASCII glyphs for borders and the trend graph. Uptime appears once in
+the session panel. The main activity feed focuses on epoch changes,
+transactions, warnings and confirmed proofs. On tall screens the main feed
+stays compact. Press **L** to expand it and show candidate details.
+Long messages wrap to keep RPC reasons readable; identical warnings
+or errors share one row with an occurrence count. Hashing and queue
+transitions already appear in live metrics. Raw JSON output from `--plain`
+retains the full engine event stream.
 
 If the dashboard has no colors, check whether the shell or a tmux server
 inherited `NO_COLOR`. Enable colors for just this process with:
