@@ -136,20 +136,11 @@ pub fn store(
     let source = temporary.path().join("wallet.json");
     let mut encrypted: Value = serde_json::from_slice(&fs::read(&source)?)?;
     encrypted["address"] = json!(format!("{:x}", signer.address()));
-    fs::write(&source, serde_json::to_vec(&encrypted)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
-    }
-    fs::File::open(&source)?.sync_all()?;
     if replace {
-        fs::rename(&source, path)?;
+        crate::storage::atomic_json(path, &encrypted)?;
     } else {
-        fs::hard_link(&source, path)?;
+        crate::storage::create_json(path, &encrypted)?;
     }
-    #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
     Ok(json!({"address":signer.address(),"encrypted":true,"wallet":path}))
 }
 pub fn create(path: &Path, password: Zeroizing<String>) -> Result<Value> {
@@ -165,10 +156,105 @@ mod tests {
         let p = d.path().join("wallet.json");
         let pass = "disposable test password";
         let info = create(&p, Zeroizing::new(pass.into())).unwrap();
+        let original = fs::read(&p).unwrap();
+        let encrypted: Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(encrypted["version"], 3);
+        assert_eq!(encrypted["crypto"]["cipher"], "aes-128-ctr");
+        assert_eq!(encrypted["crypto"]["kdf"], "scrypt");
+        validate(&p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let signer = unlock(&p, Zeroizing::new(pass.into())).unwrap();
         assert_eq!(info["address"], format!("{:#x}", signer.address()));
         assert!(unlock(&p, Zeroizing::new("wrong password".into())).is_err());
         assert!(create(&p, Zeroizing::new(pass.into())).is_err());
+        assert_eq!(fs::read(&p).unwrap(), original);
+    }
+    #[test]
+    fn concurrent_wallet_creators_preserve_the_winners_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.json");
+        let barrier = std::sync::Barrier::new(2);
+        let password = "disposable concurrent wallet password";
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        create(&path, Zeroizing::new(password.into()))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        let signer = unlock(&path, Zeroizing::new(password.into())).unwrap();
+        assert_eq!(winner["address"], format!("{:#x}", signer.address()));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn filesystem_errors_preserve_existing_data_and_leave_no_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        fs::write(&blocker, b"preserve existing data").unwrap();
+        let path = blocker.join("wallet.json");
+        let password = "disposable filesystem test password";
+        assert!(create(&path, Zeroizing::new(password.into())).is_err());
+        assert_eq!(fs::read(&blocker).unwrap(), b"preserve existing data");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(unlock(&path, Zeroizing::new(password.into())).is_err());
+        assert!(
+            unlock(
+                &directory.path().join("missing.json"),
+                Zeroizing::new(password.into())
+            )
+            .is_err()
+        );
+        assert!(create(directory.path(), Zeroizing::new(password.into())).is_err());
+    }
+    #[test]
+    fn invalid_passwords_never_create_a_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.json");
+        for password in [
+            String::new(),
+            "too short".into(),
+            "disposable password\n".into(),
+            "disposable password\r".into(),
+            "disposable password\0".into(),
+            "x".repeat(1025),
+        ] {
+            assert!(create(&path, Zeroizing::new(password)).is_err());
+            assert!(!path.exists());
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn wallet_creation_never_follows_existing_or_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.json");
+        let path = directory.path().join("wallet.json");
+        symlink(&target, &path).unwrap();
+        let password = "disposable symlink test password";
+        assert!(create(&path, Zeroizing::new(password.into())).is_err());
+        assert!(!target.exists());
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        fs::write(&target, b"existing wallet contents").unwrap();
+        assert!(create(&path, Zeroizing::new(password.into())).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing wallet contents");
+        assert_eq!(fs::read_link(&path).unwrap(), target);
     }
     #[test]
     fn standard_pbkdf2_wallet_unlocks() {

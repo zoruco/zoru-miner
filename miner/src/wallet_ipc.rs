@@ -67,9 +67,10 @@ pub fn execute(directory: &Path, mut command: Value) -> Result<Value> {
         fs::create_dir_all(&archive)?;
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let target = archive.join(format!("wallet-{stamp}.json"));
-        fs::hard_link(&path, &target)?;
-        fs::File::open(&target)?.sync_all()?;
+        crate::storage::create_private_file(&target, &fs::read(&path)?)?;
         fs::remove_file(&path)?;
+        #[cfg(unix)]
+        fs::File::open(directory)?.sync_all()?;
         return Ok(json!({"archived":true}));
     }
     if action == "create" {

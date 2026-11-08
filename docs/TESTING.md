@@ -56,3 +56,19 @@ Before publication, verify the installation and signed mining/claim behavior on 
 ## Platform coverage
 
 The current release is validated for Linux x86_64. Windows requires its own runtime checks before publication. Earlier cross-build results and their limitations are preserved in [the release history](RELEASE-1.5.4.md).
+
+### Android / Termux wallet regression
+
+Android can reject `link` and `linkat` even in a writable private directory. Wallet creation, wallet archives and pre-migration backups therefore use exclusive file creation, with mode `0600` set before writing encrypted bytes. The shared storage routine uses `create_new(true)` to reject existing files, directories and symlinks and to choose one winner between concurrent creators. It syncs the file and parent directory before reporting success and removes its new file on a write or sync error. Password rotation retains the existing temporary-file and atomic-rename path.
+
+The audit also covers `setup`: configuration creation must not use `persist_noclobber`, whose fallback can require a hard link. `inspect` and `mine` share the existing Web3 V3 unlocker; signing locks, journals, proof hashing and transaction logic are unchanged. New-file creation writes through the exclusive file handle, so readers must wait for creation to succeed before opening it. An abruptly terminated creator can leave an incomplete file, which a subsequent create must refuse to overwrite.
+
+On Linux, the filesystem regression tests deny hard-link syscalls with `EACCES`, inject `fsync` and rename errors, and impose a file-size limit to exercise partial-write cleanup. Restrictions apply only to disposable test subprocesses. All wallets and passwords are temporary test data; these tests need no deployment or public RPC:
+
+```sh
+cargo test --locked --manifest-path miner/Cargo.toml --test wallet_filesystem
+cargo test --locked --manifest-path miner/Cargo.toml --lib wallet
+cargo test --locked --manifest-path miner/Cargo.toml --bin zoru-miner-cli
+```
+
+An ARM64 Android cross build checks compilation, not execution in Termux. Before publishing an Android release, run the wallet and CLI unit tests natively and verify `wallet-create`, `setup`, `inspect` and `mine` with disposable credentials in the intended Android environment. Keep wallets and configuration in Termux's private storage, where Unix permissions are supported.

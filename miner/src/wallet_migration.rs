@@ -137,10 +137,7 @@ pub fn migrate(path: &Path, password: &str) -> Result<PrivateKeySigner> {
     }
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let backup = archive.join(format!("wallet-before-web3-{stamp}.json"));
-    fs::hard_link(path, &backup)?;
-    fs::File::open(&backup)?.sync_all()?;
-    #[cfg(unix)]
-    fs::File::open(&archive)?.sync_all()?;
+    crate::storage::create_private_file(&backup, &fs::read(path)?)?;
     crate::wallet::store(path, &signer, password, true)?;
     Ok(signer)
 }
