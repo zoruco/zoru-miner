@@ -185,7 +185,10 @@ impl View {
                     " ZORU MINER",
                     Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("   {network}   Chain {}", text(&state["chainId"]))),
+                Span::raw(format!(
+                    "   {network}   Chain {}",
+                    display(&state["chainId"])
+                )),
             ]),
             Line::from(vec![
                 Span::styled(
@@ -627,6 +630,7 @@ mod tests {
                     .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
                     .collect();
                 assert!(line.contains("ZORU MINER"));
+                assert!(line.contains("Chain 6736"));
             }
         }
         assert!(view.scroll > 0);
