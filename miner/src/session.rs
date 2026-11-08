@@ -1286,20 +1286,37 @@ impl Session {
                     continue;
                 }
                 if !options.dry_run
-                    && Instant::now() >= beacon_retry
                     && let Some(epoch) = run.client.pending_beacon_epoch()
                 {
-                    let prepared = writer_beacon.lock().unwrap().clone();
-                    if let Some(prepared) = prepared.filter(|p| p.epoch == epoch) {
-                        if let Err(error) = run.publish_beacon(&prepared) {
-                            if error.to_string().starts_with("STALE_BEACON:") {
-                                *writer_beacon.lock().unwrap() = None;
-                            } else {
-                                run.error(error, false);
+                    if Instant::now() >= beacon_retry {
+                        let prepared = writer_beacon.lock().unwrap().clone();
+                        if let Some(prepared) = prepared.filter(|p| p.epoch == epoch) {
+                            let clear = match run.publish_beacon(&prepared) {
+                                Ok(()) => true,
+                                Err(error) if error.to_string().starts_with("STALE_BEACON:") => {
+                                    true
+                                }
+                                Err(error) => {
+                                    run.error(error, false);
+                                    false
+                                }
+                            };
+                            if clear {
+                                let mut cached = writer_beacon.lock().unwrap();
+                                if cached.as_ref().is_some_and(|p| {
+                                    p.epoch == prepared.epoch && p.round == prepared.round
+                                }) {
+                                    *cached = None;
+                                }
                             }
+                            beacon_retry = Instant::now() + Duration::from_secs(2);
                         }
-                        beacon_retry = Instant::now() + Duration::from_secs(2);
                     }
+                    // Reserve the nonce writer while the next seed is being
+                    // prepared, not only once preparation has finished.
+                    // Workers keep hashing the valid transition context.
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
                 if !options.dry_run
                     && options.auto_claim_after > 0
