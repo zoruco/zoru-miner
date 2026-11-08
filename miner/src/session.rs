@@ -28,6 +28,7 @@ use std::{
 use zeroize::Zeroizing;
 
 pub use crate::Emit;
+const SETTLEMENT_MIN_RESERVE_SECONDS: u64 = 20;
 #[derive(Clone)]
 pub struct Options {
     pub manifest: PathBuf,
@@ -79,6 +80,14 @@ struct Candidate {
     work: Work,
     nonce: U256,
     digest: B256,
+}
+
+#[derive(Clone)]
+struct PreparedBeacon {
+    epoch: u64,
+    round: U256,
+    data: Value,
+    signature: Vec<u8>,
 }
 
 // Extend the existing bounded channel with admission metrics and bounded
@@ -149,6 +158,20 @@ pub struct Session {
     _lock: Option<WriterLock>,
     emit: Emit,
     revision: Mutex<U256>,
+}
+fn claim_has_turn(queued_proofs: u64, proofs_since_claim: u64) -> bool {
+    queued_proofs == 0 || proofs_since_claim >= 3
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    #[test]
+    fn claims_yield_to_queued_proofs_without_starving_settlement() {
+        assert!(!super::claim_has_turn(64, 0));
+        assert!(!super::claim_has_turn(1, 2));
+        assert!(super::claim_has_turn(64, 3));
+        assert!(super::claim_has_turn(0, 0));
+    }
 }
 fn topic(signature: &str) -> B256 {
     abi::keccak(signature.as_bytes())
@@ -413,6 +436,7 @@ impl Session {
             }
             stats.clone()
         };
+        data["inclusionMarginSeconds"] = json!(self.client.inclusion_margin());
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
         data["transactionPipeline"] = self.client.pipeline.lock().unwrap().clone();
         data["pendingTransactions"] = data["transactionPipeline"]["pending"].clone();
@@ -804,19 +828,18 @@ impl Session {
             abi::number(data[3]) == U256::from(1),
         ))
     }
-    fn publish_beacon(&self, epoch: u64) -> Result<()> {
-        let signer = self.signer.as_ref().context("Unlock a mainnet wallet")?;
+    fn prepare_beacon(&self, epoch: u64) -> Result<Option<PreparedBeacon>> {
         let c = &self.client;
         let d = &c.manifest;
         if c.epoch()? != epoch {
-            return Ok(());
+            return Ok(None);
         }
         let word = abi::uint(U256::from(epoch));
         if abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO {
-            return Ok(());
+            return Ok(None);
         }
         if c.number(d.ledger, "admissionPaused()")? != U256::ZERO {
-            return Ok(());
+            return Ok(None);
         }
         let round = abi::scalar(&c.call(d.beacon, "expectedRound(uint48)", &[word])?)?;
         let fetched = fetch_scheduled_beacon(
@@ -831,15 +854,39 @@ impl Session {
                     || abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)?
                         != U256::ZERO
                 {
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(error);
             }
         };
         if c.epoch()? != epoch {
+            return Ok(None);
+        }
+        Ok(Some(PreparedBeacon {
+            epoch,
+            round,
+            data,
+            signature,
+        }))
+    }
+    fn publish_beacon(&self, prepared: &PreparedBeacon) -> Result<()> {
+        let signer = self.signer.as_ref().context("Unlock a mainnet wallet")?;
+        let c = &self.client;
+        let d = &c.manifest;
+        let epoch = prepared.epoch;
+        let word = abi::uint(U256::from(epoch));
+        if c.epoch()? != epoch
+            || abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO
+        {
             return Ok(());
         }
-        let encoded = beacon_publication(epoch, &signature)?;
+        ensure!(
+            abi::scalar(&c.call(d.beacon, "expectedRound(uint48)", &[word])?)? == prepared.round,
+            "STALE_BEACON: scheduled round changed"
+        );
+        let data = &prepared.data;
+        let round = prepared.round;
+        let encoded = beacon_publication(epoch, &prepared.signature)?;
         match c.send(signer, "publish-drand", d.beacon, encoded, None) {
             Ok(receipt) => {
                 self.stats.lock().unwrap()["beaconsPublished"].as_array_mut().unwrap().push(json!({"epoch":epoch,"round":round.to_string(),"hash":receipt["transactionHash"],"signature":data["signature"],"randomness":data["randomness"]}));
@@ -1101,8 +1148,8 @@ impl Session {
         let hashes = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicU64::new(0));
         let resource = Arc::new(AtomicBool::new(false));
-        // Only proof candidates are queued. Beacon publication is selected
-        // from the current epoch by the writer, after any slow transaction.
+        // Proofs use a bounded queue. Beacon retrieval/authentication runs
+        // separately; the single nonce writer consumes only a ready beacon.
         let (candidates, rx) = Candidates::new();
         let run = self.clone();
         let poll = thread::spawn(move || {
@@ -1186,14 +1233,44 @@ impl Session {
                 }
             }
         });
+        let prepared_beacon = Arc::new(Mutex::new(None::<PreparedBeacon>));
+        let preparer = if options.dry_run {
+            None
+        } else {
+            let run = self.clone();
+            let prepared = prepared_beacon.clone();
+            Some(thread::spawn(move || {
+                while !run.stop.load(Ordering::Relaxed) {
+                    let cached_epoch = prepared.lock().unwrap().as_ref().map(|p| p.epoch);
+                    if !run.pause.load(Ordering::Relaxed)
+                        && let Some(epoch) = run.client.pending_beacon_epoch()
+                        && cached_epoch != Some(epoch)
+                    {
+                        match run.prepare_beacon(epoch) {
+                            Ok(Some(beacon)) => *prepared.lock().unwrap() = Some(beacon),
+                            Ok(None) => {}
+                            Err(error) => run.error(error, false),
+                        }
+                    }
+                    for _ in 0..20 {
+                        if run.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }))
+        };
         let run = self.clone();
         let writer_resource = resource.clone();
         let writer_queue = candidates.clone();
         let accepted_limit = options.max_accepted;
+        let writer_beacon = prepared_beacon.clone();
         let writer = thread::spawn(move || {
             let mut claim_retry = Instant::now();
             let mut beacon_retry = Instant::now();
             let mut claims_remaining = 0;
+            let mut proofs_since_claim = 3u64;
             while !run.stop.load(Ordering::Relaxed) {
                 // Gate the only transaction writer before it consumes another
                 // queued result. The UI polling interval must not add a proof.
@@ -1207,7 +1284,35 @@ impl Session {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                if !options.dry_run && options.auto_claim_after > 0 && Instant::now() >= claim_retry
+                if !options.dry_run
+                    && Instant::now() >= beacon_retry
+                    && let Some(epoch) = run.client.pending_beacon_epoch()
+                {
+                    let prepared = writer_beacon.lock().unwrap().clone();
+                    if let Some(prepared) = prepared.filter(|p| p.epoch == epoch) {
+                        if let Err(error) = run.publish_beacon(&prepared) {
+                            if error.to_string().starts_with("STALE_BEACON:") {
+                                *writer_beacon.lock().unwrap() = None;
+                            } else {
+                                run.error(error, false);
+                            }
+                        }
+                        beacon_retry = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+                if !options.dry_run
+                    && options.auto_claim_after > 0
+                    && Instant::now() >= claim_retry
+                    && run.client.settlement_window_open(
+                        run.client
+                            .inclusion_margin()
+                            .saturating_mul(2)
+                            .max(SETTLEMENT_MIN_RESERVE_SECONDS),
+                    )
+                    && claim_has_turn(
+                        writer_queue.depth.load(Ordering::Relaxed),
+                        proofs_since_claim,
+                    )
                 {
                     let pending = match run.history.pending_count() {
                         Ok(count) => count,
@@ -1234,10 +1339,7 @@ impl Session {
                         claim_retry = Instant::now() + Duration::from_secs(2);
                     } else {
                         run.stats.lock().unwrap()["autoClaimStatus"] = json!("claiming");
-                        run.event(
-                            "CLAIM",
-                            "Settling eligible rewards; hashing continues on valid work",
-                        );
+                        run.event("CLAIM", "Eligible proof rewards");
                         let mut completed = 0;
                         match run.settle_batch(1, false) {
                             Ok(result) => {
@@ -1245,6 +1347,7 @@ impl Session {
                                 completed = count as u64;
                                 claims_remaining = claims_remaining.saturating_sub(completed);
                                 if count > 0 {
+                                    proofs_since_claim = 0;
                                     set_counter(
                                         &mut run.stats.lock().unwrap(),
                                         "autoClaimed",
@@ -1268,19 +1371,6 @@ impl Session {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                if !options.dry_run
-                    && run.work.read().unwrap().is_none()
-                    && Instant::now() >= beacon_retry
-                {
-                    // The poller's fresh block already identifies the epoch.
-                    // Do not retry beacon reads after the inclusion window closes.
-                    if let Some(epoch) = run.client.pending_beacon_epoch()
-                        && let Err(error) = run.publish_beacon(epoch)
-                    {
-                        run.error(error, false);
-                    }
-                    beacon_retry = Instant::now() + Duration::from_secs(2);
-                }
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(candidate) => {
                         writer_queue.depth.fetch_sub(1, Ordering::Relaxed);
@@ -1293,19 +1383,24 @@ impl Session {
                             set_counter(&mut run.stats.lock().unwrap(), "staleBeforeBroadcast", 1);
                         } else if options.dry_run {
                             set_counter(&mut run.stats.lock().unwrap(), "dryRunCandidates", 1);
-                        } else if let Err(error) = run.submit_candidate(candidate) {
-                            if is_stale_candidate(&error.to_string()) {
-                                // The protocol's last-moment epoch/generation
-                                // guard can still win a race after the queue
-                                // check. It is a local discard, not an RPC or
-                                // mining failure and never an on-chain reject.
-                                set_counter(
-                                    &mut run.stats.lock().unwrap(),
-                                    "staleBeforeBroadcast",
-                                    1,
-                                );
-                            } else {
-                                run.error(error, true)
+                        } else {
+                            match run.submit_candidate(candidate) {
+                                Ok(()) => proofs_since_claim = proofs_since_claim.saturating_add(1),
+                                Err(error) => {
+                                    if is_stale_candidate(&error.to_string()) {
+                                        // The protocol's last-moment epoch/generation
+                                        // guard can still win a race after the queue
+                                        // check. It is a local discard, not an RPC or
+                                        // mining failure and never an on-chain reject.
+                                        set_counter(
+                                            &mut run.stats.lock().unwrap(),
+                                            "staleBeforeBroadcast",
+                                            1,
+                                        );
+                                    } else {
+                                        run.error(error, true)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1390,6 +1485,9 @@ impl Session {
             if !self.stop.load(Ordering::Relaxed)
                 && (poll.is_finished()
                     || writer.is_finished()
+                    || preparer
+                        .as_ref()
+                        .is_some_and(thread::JoinHandle::is_finished)
                     || snapshots.is_finished()
                     || workers.iter().any(thread::JoinHandle::is_finished))
             {
@@ -1412,6 +1510,7 @@ impl Session {
             {
                 break;
             }
+            stats["waitReason"] = json!(self.client.work_wait_reason());
             stats["status"] = json!(if self.pause.load(Ordering::Relaxed) {
                 "paused"
             } else if blocked {
@@ -1467,6 +1566,9 @@ impl Session {
         thread_failed |= poll.join().is_err();
         thread_failed |= writer.join().is_err();
         thread_failed |= snapshots.join().is_err();
+        if let Some(preparer) = preparer {
+            thread_failed |= preparer.join().is_err();
+        }
         ensure!(
             !thread_failed,
             "A mining thread failed; signed journals are retained"
@@ -1493,6 +1595,7 @@ impl Session {
             });
             stats.clone()
         };
+        data["inclusionMarginSeconds"] = json!(self.client.inclusion_margin());
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
         let requests = self.client.read.request_count()
             + self.client.submit.request_count()

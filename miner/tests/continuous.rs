@@ -234,19 +234,45 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         }
         panic!("No mined proof for the rollover fixture");
     });
+    // Let the deliberately slow snapshot finish while proofs continue. An
+    // exact proof limit can stop its RPC sequence before it publishes any
+    // snapshot when earlier fixtures have left more history to synchronize.
+    // The separate mining_limit fixture covers the exact writer limit.
+    let completed_states = states.clone();
+    let completed_inspections = inspections.clone();
+    let completed_stop = session.stop.clone();
+    let completion = thread::spawn(move || {
+        while !completed_stop.load(Ordering::Relaxed) {
+            let accepted = completed_states
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|s| s["accepted"].as_u64())
+                .unwrap_or(0);
+            let incomplete = completed_inspections.lock().unwrap().iter().any(|s| {
+                s["myRewardsHistoryComplete"] == false && s["myUnclaimedBaseUnits"].is_null()
+            });
+            if accepted >= 2 && incomplete {
+                completed_stop.store(true, Ordering::SeqCst);
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
     let result = session
         .run(Run {
             workers: 2,
             cpu_budget: 0.5,
             seconds: 100,
-            max_accepted: 2,
+            max_accepted: 0,
             auto_claim_after: 0,
             dry_run: false,
         })
         .unwrap();
     rollover.join().unwrap();
+    completion.join().unwrap();
     record("proof", &result);
-    assert_eq!(result["accepted"], 2, "{result}");
+    assert!(result["accepted"].as_u64().unwrap_or(0) >= 2, "{result}");
     assert_eq!(result["rejected"], 0, "{result}");
     assert_eq!(
         result["errors"],

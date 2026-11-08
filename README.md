@@ -41,20 +41,22 @@ Setup selects your existing wallet, trusted manifest, EVM RPC, state directory, 
 ```sh
 zoru-miner-cli setup \
   --manifest ./share/zoru-miner/deployment.json \
-  --rpc https://vexascan.com/rpc \
+  --rpc https://api.windcrypto.com/rpc \
   --wallet ./wallet.json --state-dir ./state \
   --workers 2 --cpu-budget 1 --auto-claim-after 50
 ```
 
 Configuration lives at `$XDG_CONFIG_HOME/zoru-miner/config.json` (normally `~/.config/zoru-miner/config.json`) on Linux, or `%APPDATA%\ZORU\config.json` on Windows. CLI overrides take precedence over saved settings, followed by safe defaults: one worker, 0.5 CPU core and auto-claim after 50 unclaimed proofs. For example, `zoru-miner-cli mine --workers 2 --cpu-budget 1` changes only that run. Back up the config before deliberately replacing it. The desktop keeps its existing preferences and uses the same Rust connection validation and mining engine.
 
-The miner prompts for your wallet password at startup. `--password-stdin` reads one password line for controlled automation; supply it through a protected pipe or file descriptor. Configuration contains paths and preferences, never wallet passwords or private keys. A native RPC is optional; normal mining uses just `--rpc https://vexascan.com/rpc`.
+The miner prompts for your wallet password at startup. `--password-stdin` reads one password line for controlled automation; supply it through a protected pipe or file descriptor. Configuration contains paths and preferences, never wallet passwords or private keys. A native RPC is optional; normal mining uses just `--rpc https://api.windcrypto.com/rpc`.
 
 An interactive terminal shows a dark dashboard with fixed balances, contract and engine metrics above scrolling events. **Q** stops gracefully, **Up/Down** and **Page Up/Page Down** scroll, **L** focuses logs, and **R** redraws the cached view. Use `--ascii` for basic borders or `--plain` for JSON events. Redirected output, services and noninteractive terminals automatically use JSON. Unavailable or incompletely indexed rewards show as N/A; the snapshot age identifies cached data.
 
 Hash workers continue while the single transaction writer submits proofs, tracks receipts, seals epochs and claims rewards. Candidates are bounded and checked against their epoch, seed, generation and target. Workers switch work at epoch changes and stop when work expires, admission closes, the proof limit is reached or RPC validation fails. Locally finding a candidate does not guarantee on-chain acceptance.
 
-The CLI claims eligible rewards automatically once at least 50 accepted proofs remain unclaimed. Set `--auto-claim-after 0` to disable this, or choose another threshold. The threshold does not combine claims into one transaction: each proof still needs its own claim transaction. The desktop uses manual claims.
+The shared engine prepares and authenticates beacons in the background. Its send guard starts at 15 seconds and adapts to 5–15 seconds after three successful proof transactions using measured full transaction duration. Mining can still wait for a new verified epoch or an expired work lease; the CLI and GUI show the reason.
+
+The CLI claims eligible rewards automatically once at least 50 accepted proofs remain unclaimed. Set `--auto-claim-after 0` to disable this, or choose another threshold. The threshold does not combine claims into one transaction: each proof still needs its own claim transaction. Queued proofs receive priority between claims, with settlement given a turn after three accepted proofs or when the queue is empty. The desktop uses manual claims.
 
 Use `rewards` with the same connection options for balances and rewards, or `claim` for a manual claim session. A public `--account <address>` allows read-only reward inspection without opening a wallet. `--session-budget-wei` optionally limits total fees for one CLI session; without it the CLI has no session allowance.
 

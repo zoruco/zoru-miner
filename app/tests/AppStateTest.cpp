@@ -113,6 +113,22 @@ class AppStateTest final : public QObject {
         state.m_journalPending = false;
         QVERIFY(!state.pendingTransaction());
     }
+    void epoch_guard_preserves_zero_samples_and_explains_the_wait() {
+        QTemporaryDir directory;
+        AppState state(directory.path(), false);
+        state.m_running = true;
+        state.m_sessionAuthorized = true;
+        state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{
+            {"status", "mining"}, {"hashesPerSecond", 12345}}}});
+        state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{
+            {"status", "waiting-beacon-or-recovery"}, {"hashesPerSecond", 0},
+            {"waitReason", "epoch-safety-window"}, {"inclusionMarginSeconds", 7}}}});
+        QCOMPARE(state.miningStatus(), QString("Epoch ending · 7s send guard"));
+        QCOMPARE(state.hashrateValue(), QString("0"));
+        QCOMPARE(state.hashrateUnit(), QString("H/s"));
+        QCOMPARE(state.hashrateSamples().size(), 2);
+        QCOMPARE(state.hashrateSamples().last().toMap().value("value").toDouble(), 0.0);
+    }
     void framed_output_accepts_large_bursts_and_rejects_oversized_frames() {
         QTemporaryDir directory;
         AppState state(directory.path(), false);

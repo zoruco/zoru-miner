@@ -38,7 +38,7 @@ A wallet's history must be synchronized before personal totals can be treated as
 
 ```sh
 zoru-miner-cli rewards --manifest ./deployment.json \
-  --rpc https://vexascan.com/rpc --state-dir ./miner-state \
+  --rpc https://api.windcrypto.com/rpc --state-dir ./miner-state \
   --account 0xYourPublicEvmAddress
 ```
 

@@ -181,7 +181,7 @@ AppState::AppState(const QString &storageRoot, bool enableNetwork, QObject *pare
             m_rpcUrls.append(url);
     }
     if (m_rpcUrls.isEmpty())
-        m_rpcUrls = {"https://vexascan.com/rpc"};
+        m_rpcUrls = {"https://api.windcrypto.com/rpc"};
     const auto selected = normalizedRpc(m_preferences->value("connection/rpcUrl").toString());
     m_rpcUrl = m_rpcUrls.contains(selected) ? selected : m_rpcUrls.first();
     saveRpcPreferences();
@@ -1273,16 +1273,16 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
         m_beaconVerified = !work.value("seed").toString().isEmpty() && phase == "mining";
     }
     const double rate = data.value("hashesPerSecond").toDouble();
-    if (std::isfinite(rate) && rate > 0 && m_hashing) {
-        m_hashrate = rate;
-        m_lastHashrate = rate;
+    m_hashrate = type == "mine-result" || !std::isfinite(rate) || rate < 0 ? 0 : rate;
+    if (m_hashrate > 0) {
+        m_lastHashrate = m_hashrate;
         m_lastMeasuredAt = QDateTime::currentMSecsSinceEpoch();
+    }
+    if (type == "state") {
+        const auto measuredAt = QDateTime::currentMSecsSinceEpoch();
         m_hashrateSamples = bounded(
-            m_hashrateSamples +
-                QVariantList{QVariantMap{{"timestamp", m_lastMeasuredAt / 1000}, {"value", rate}}},
-            180);
-    } else
-        m_hashrate = 0;
+            m_hashrateSamples + QVariantList{QVariantMap{{"timestamp", measuredAt / 1000}, {"value", m_hashrate}}}, 180);
+    }
     if (m_stopRequested)
         m_miningStatus = "Stopping";
     else if (phase == "mining")
@@ -1291,8 +1291,17 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
         m_miningStatus = "Paused";
     else if (phase == "paused-resource")
         m_miningStatus = "Waiting for CPU or memory";
-    else if (phase == "waiting-beacon-or-recovery")
-        m_miningStatus = "Refreshing mining work";
+    else if (phase == "waiting-beacon-or-recovery") {
+        const auto reason = data.value("waitReason").toString();
+        if (reason == "epoch-safety-window")
+            m_miningStatus = QString("Epoch ending · %1s send guard").arg(data.value("inclusionMarginSeconds").toInt(15));
+        else if (reason == "stale-work-lease")
+            m_miningStatus = "Refreshing expired work lease";
+        else if (reason == "awaiting-beacon")
+            m_miningStatus = "Waiting for verified epoch beacon";
+        else
+            m_miningStatus = "Waiting for verified epoch work";
+    }
     else if (phase == "rpc-degraded")
         m_miningStatus = "RPC degraded";
     else
@@ -1316,15 +1325,13 @@ QString AppState::efficiency() const {
 }
 
 QString AppState::hashrateUnit() const {
-    return rateUnit(activelyHashing() ? m_hashrate : m_lastHashrate >= 0 ? m_lastHashrate : 0);
+    return rateUnit(m_running ? qMax(0.0, m_hashrate) : m_lastHashrate >= 0 ? m_lastHashrate : 0);
 }
 
 QString AppState::hashrateValue() const {
-    if (!activelyHashing())
+    if (!m_running)
         return m_lastHashrate >= 0 ? rateNumber(m_lastHashrate) : QStringLiteral("—");
-    if (m_hashrate < 0)
-        return "—";
-    return rateNumber(m_hashrate);
+    return rateNumber(qMax(0.0, m_hashrate));
 }
 
 QString AppState::lastMeasuredHashrate() const {
@@ -1498,7 +1505,7 @@ void AppState::resetSettings() {
     m_stopAfterProof = false;
     m_autoLock = 15;
     m_notifications = true;
-    m_rpcUrl = "https://vexascan.com/rpc";
+    m_rpcUrl = "https://api.windcrypto.com/rpc";
     m_rpcUrls = {m_rpcUrl};
     m_sessionBudget = "0.2";
     saveRpcPreferences();

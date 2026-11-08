@@ -1,6 +1,6 @@
 [package]
 name = "zoru-miner"
-version = "1.5.7"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"

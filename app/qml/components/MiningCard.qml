@@ -11,7 +11,7 @@ Card {
         StatusChip { Layout.maximumWidth: Math.max(80, root.width - root.padding * 2 - 160); text: root.state.miningStatus; good: root.state.activelyHashing }
         Text { objectName: "miningUptime"; text: (root.state.mining && !root.state.claiming ? "Session uptime  " : "Last session  ") + root.state.uptime; color: P.color("muted"); font.pixelSize: 12; Layout.columnSpan: 2; Layout.fillWidth: true; wrapMode: Text.NoWrap }
     }
-    Text { text: !root.state.activelyHashing && root.state.lastMeasuredHashrate !== "—" ? "Last measured hashrate · CPU idle" : "Current hashrate"; color: P.color("muted"); font.pixelSize: 13; Layout.fillWidth: true }
+    Text { text: !root.state.mining && root.state.lastMeasuredHashrate !== "—" ? "Last measured hashrate · CPU idle" : "Current hashrate"; color: P.color("muted"); font.pixelSize: 13; Layout.fillWidth: true }
     GridLayout {
         id: performance
         Layout.fillWidth: true; Layout.minimumWidth: 0

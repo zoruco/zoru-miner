@@ -32,7 +32,7 @@ Save the connection once:
 ```sh
 zoru-miner-cli setup \
   --manifest "$HOME/.local/share/zoru-miner/deployment.json" \
-  --rpc https://vexascan.com/rpc \
+  --rpc https://api.windcrypto.com/rpc \
   --wallet "$HOME/.local/share/zoru-miner/mining.wallet.json" \
   --state-dir "$HOME/.local/share/zoru-miner/state" \
   --workers 1 --cpu-budget 0.5 --auto-claim-after 50
@@ -68,7 +68,7 @@ graph leaves headroom above peaks. New samples arrive at the right edge.
 Phone screens use two columns;
 wider terminals show network and engine details side by side. `--ascii`
 uses ASCII glyphs for borders and the trend graph. Uptime appears once in
-the session panel. The main activity feed focuses on epoch changes,
+the session panel. **Send guard** shows the current measured submission margin; **EPOCH END** identifies its end-of-epoch wait. The main activity feed focuses on epoch changes,
 transactions, warnings and confirmed proofs. The activity panel fills all
 remaining screen space above the footer. Press **L** to show candidate details.
 Long messages wrap to keep RPC reasons readable; identical warnings

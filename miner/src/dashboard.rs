@@ -227,6 +227,9 @@ impl View {
             "rpc-degraded" => ("RPC DEGRADED", RED),
             "stopped" => ("STOPPED", MUTED),
             "stopping" => ("STOPPING", GOLD),
+            _ if s["waitReason"] == "epoch-safety-window" => ("EPOCH END", GOLD),
+            _ if s["waitReason"] == "stale-work-lease" => ("REFRESHING WORK", GOLD),
+            _ if s["waitReason"] == "awaiting-beacon" => ("WAITING BEACON", GOLD),
             _ => ("WAITING FOR WORK", GOLD),
         };
         let (rpc, rpc_color) = if s["rpcHealthy"] == false {
@@ -479,12 +482,8 @@ impl View {
                         MUTED,
                     ),
                     (
-                        "Stale / overflow",
-                        format!(
-                            "{} / {}",
-                            display(&s["staleBeforeBroadcast"]),
-                            display(&s["candidateQueueOverflow"])
-                        ),
+                        "Send guard",
+                        format!("{}s", display(&s["inclusionMarginSeconds"])),
                         MUTED,
                     ),
                 ],
@@ -528,7 +527,11 @@ impl View {
                         CYAN,
                     ),
                     ("Uptime", uptime, INK),
-                    ("Auto-claim", display(&s["autoClaimAfter"]), GOLD),
+                    (
+                        "Send guard",
+                        format!("{}s", display(&s["inclusionMarginSeconds"])),
+                        GOLD,
+                    ),
                 ],
                 11,
             );
@@ -548,7 +551,7 @@ impl View {
                 badge("L", MUTED),
                 Span::styled(" Detail  ", Style::default().fg(MUTED)),
                 badge("R", MUTED),
-                Span::styled(" Live  / UTC", Style::default().fg(MUTED)),
+                Span::styled(" Latest / UTC", Style::default().fg(MUTED)),
             ])
         };
         frame.render_widget(Paragraph::new(controls), rows[5]);
@@ -642,9 +645,9 @@ impl View {
                 .border_style(Style::default().fg(if self.logs { CYAN } else { EDGE }))
                 .title_bottom(Line::styled(
                     if self.scroll == 0 {
-                        " LIVE ".to_owned()
+                        String::new()
                     } else {
-                        format!(" {} events back / R live ", self.scroll)
+                        format!(" {} events back / R latest ", self.scroll)
                     },
                     Style::default().fg(if self.scroll == 0 { GREEN } else { GOLD }),
                 )),
@@ -951,6 +954,8 @@ mod tests {
                         "{width}x{height} missing {expected}:\n{screen}"
                     );
                 }
+                assert!(!screen.contains(" LIVE "));
+                assert!(!screen.contains(" R live "));
                 assert!(!screen.contains("VEX available"));
                 assert!(!screen.contains("ZORU balance"));
                 if height >= 28 {

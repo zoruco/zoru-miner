@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -34,13 +34,46 @@ pub const NATIVE_ID: &str = "f9f432b1851b5c179d2091a96f593aaed50ec7466b74f89301f
 pub const TEST_NATIVE_ID: &str = "c6b5914584c79ad99944f4f77fe813fa2e41373058dadc7c19211e03c886a2fa";
 pub const DRAND_HASH: &str = "04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3";
 pub const REORG_WINDOW: u64 = 128;
-// Mainnet relay inclusion observed during validation took up to ten seconds.
-// Retain a further five seconds before a proof's 60-second epoch closes.
-const INCLUSION_MARGIN_SECONDS: u64 = 15;
+// Start conservatively; learn the full preflight-to-receipt time of this RPC.
+const INITIAL_INCLUSION_MARGIN_SECONDS: u64 = 15;
+const MIN_INCLUSION_MARGIN_SECONDS: u64 = 5;
 const WORK_LEASE_SECONDS: u64 = 5;
 
-fn mining_window_open(now: u64, end_time: u64) -> bool {
-    now < end_time.saturating_sub(INCLUSION_MARGIN_SECONDS)
+#[derive(Default)]
+struct InclusionWindow {
+    samples: VecDeque<Duration>,
+    failovers: u64,
+}
+impl InclusionWindow {
+    fn observe_route(&mut self, failovers: u64) {
+        if self.failovers != failovers {
+            self.samples.clear();
+            self.failovers = failovers;
+        }
+    }
+    fn record(&mut self, elapsed: Duration) {
+        self.samples.push_back(elapsed);
+        if self.samples.len() > 16 {
+            self.samples.pop_front();
+        }
+    }
+    fn margin(&self) -> u64 {
+        if self.samples.len() < 3 {
+            return INITIAL_INCLUSION_MARGIN_SECONDS;
+        }
+        let slowest = self.samples.iter().copied().max().unwrap_or_default();
+        slowest
+            .as_secs()
+            .saturating_add(u64::from(slowest.subsec_nanos() > 0))
+            .saturating_add(2)
+            .clamp(
+                MIN_INCLUSION_MARGIN_SECONDS,
+                INITIAL_INCLUSION_MARGIN_SECONDS,
+            )
+    }
+}
+fn mining_window_open(now: u64, end_time: u64, margin: u64) -> bool {
+    now < end_time.saturating_sub(margin)
 }
 
 pub(crate) fn work_unavailable(error: &anyhow::Error) -> bool {
@@ -312,14 +345,11 @@ struct WorkSnapshot {
     timestamp: u64,
     beneficiary: Address,
     work: Option<Work>,
+    beacon_missing: bool,
 }
 
 impl WorkSnapshot {
-    fn pending_beacon_epoch(&self, manifest: &Manifest) -> Option<u64> {
-        let age = self.observed.elapsed();
-        if self.work.is_some() || age >= Duration::from_secs(WORK_LEASE_SECONDS) {
-            return None;
-        }
+    fn epoch_window(&self, manifest: &Manifest) -> Option<(u64, u64)> {
         let epoch = self
             .timestamp
             .checked_sub(manifest.launch_time)?
@@ -327,8 +357,50 @@ impl WorkSnapshot {
         let end = manifest
             .launch_time
             .checked_add(epoch.checked_add(1)?.checked_mul(manifest.epoch_seconds)?)?;
+        Some((epoch, end))
+    }
+    fn pending_beacon_epoch(&self, manifest: &Manifest, margin: u64) -> Option<u64> {
+        let age = self.observed.elapsed();
+        if self.work.is_some()
+            || !self.beacon_missing
+            || age >= Duration::from_secs(WORK_LEASE_SECONDS)
+        {
+            return None;
+        }
+        let (epoch, end) = self.epoch_window(manifest)?;
         let now = self.timestamp.checked_add(age.as_secs())?;
-        mining_window_open(now, end).then_some(epoch)
+        mining_window_open(now, end, margin).then_some(epoch)
+    }
+    fn wait_reason(&self, manifest: &Manifest, margin: u64) -> &'static str {
+        let age = self.observed.elapsed();
+        if age >= Duration::from_secs(WORK_LEASE_SECONDS) {
+            return "stale-work-lease";
+        }
+        if let Some((_, end)) = self.epoch_window(manifest)
+            && !mining_window_open(self.timestamp.saturating_add(age.as_secs()), end, margin)
+        {
+            return "epoch-safety-window";
+        }
+        if self.work.is_some() {
+            return "none";
+        }
+        if self.beacon_missing {
+            "awaiting-beacon"
+        } else {
+            "protocol-inactive"
+        }
+    }
+    fn settlement_window_open(&self, manifest: &Manifest, reserve: u64) -> bool {
+        let age = self.observed.elapsed();
+        if self.beacon_missing || age >= Duration::from_secs(WORK_LEASE_SECONDS) {
+            return false;
+        }
+        self.epoch_window(manifest).is_some_and(|(_, end)| {
+            self.timestamp
+                .saturating_add(age.as_secs())
+                .saturating_add(reserve)
+                < end
+        })
     }
 }
 
@@ -345,6 +417,7 @@ pub struct Client {
     validated_work: Mutex<Option<(Work, Address)>>,
     work_snapshot: Mutex<Option<WorkSnapshot>>,
     proof_limit: Mutex<U256>,
+    inclusion_window: Mutex<InclusionWindow>,
     pub pipeline: Mutex<Value>,
     pub observer: Mutex<Option<crate::Emit>>,
     writer: Mutex<()>,
@@ -386,6 +459,7 @@ impl Client {
             validated_work: Mutex::new(None),
             work_snapshot: Mutex::new(None),
             proof_limit: Mutex::new(U256::ZERO),
+            inclusion_window: Mutex::new(InclusionWindow::default()),
             pipeline: Mutex::new(json!({"status":"idle","pending":0})),
             observer: Mutex::new(None),
             writer: Mutex::new(()),
@@ -607,19 +681,40 @@ impl Client {
                 s.observed
                     + Duration::from_secs(
                         w.end_time
-                            .saturating_sub(INCLUSION_MARGIN_SECONDS)
+                            .saturating_sub(self.inclusion_margin())
                             .saturating_sub(s.timestamp)
                             .min(WORK_LEASE_SECONDS),
                     )
             })
         })
     }
+    pub fn inclusion_margin(&self) -> u64 {
+        let mut window = self.inclusion_window.lock().unwrap();
+        window.observe_route(self.read.failover_count() + self.submit.failover_count());
+        window.margin()
+    }
     pub(crate) fn pending_beacon_epoch(&self) -> Option<u64> {
         self.work_snapshot
             .lock()
             .unwrap()
             .as_ref()?
-            .pending_beacon_epoch(&self.manifest)
+            .pending_beacon_epoch(&self.manifest, self.inclusion_margin())
+    }
+    pub(crate) fn settlement_window_open(&self, reserve: u64) -> bool {
+        self.work_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.settlement_window_open(&self.manifest, reserve))
+    }
+    pub(crate) fn work_wait_reason(&self) -> &'static str {
+        self.work_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or("refreshing-work", |s| {
+                s.wait_reason(&self.manifest, self.inclusion_margin())
+            })
     }
     fn observe_head(&self, height: u64) -> Result<()> {
         let mut previous = self.head.lock().unwrap();
@@ -653,13 +748,14 @@ impl Client {
         )?
         .try_into()?;
         let observed = Instant::now();
-        let work = self.work_at(beneficiary, now, height)?;
+        let (work, beacon_missing) = self.work_at(beneficiary, now, height)?;
         *self.work_snapshot.lock().unwrap() = Some(WorkSnapshot {
             block: hash,
             observed,
             timestamp: now,
             beneficiary,
             work: work.clone(),
+            beacon_missing,
         });
         Ok(work)
     }
@@ -676,21 +772,26 @@ impl Client {
         )?;
         Ok(result.as_str().context("Invalid ABI response")?.to_owned())
     }
-    fn work_at(&self, beneficiary: Address, now: u64, height: &str) -> Result<Option<Work>> {
+    fn work_at(
+        &self,
+        beneficiary: Address,
+        now: u64,
+        height: &str,
+    ) -> Result<(Option<Work>, bool)> {
         let d = &self.manifest;
         if now < d.launch_time {
-            return Ok(None);
+            return Ok((None, false));
         }
         let epoch = (now - d.launch_time) / d.epoch_seconds;
         let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
-        if !mining_window_open(now, end_time) {
-            return Ok(None);
+        if !mining_window_open(now, end_time, self.inclusion_margin()) {
+            return Ok((None, false));
         }
         if abi::boolean(&self.call_at(d.ledger, "admissionPaused()", &[], height)?)? {
-            return Ok(None);
+            return Ok((None, false));
         }
         if abi::abi_address(&self.call_at(d.token, "issuer()", &[], height)?)? != d.ledger {
-            return Ok(None);
+            return Ok((None, false));
         }
         let word = abi::uint(U256::from(epoch));
         let info = abi::words(&self.call_at(d.ledger, "epochInfo(uint48)", &[word], height)?)?;
@@ -701,13 +802,13 @@ impl Client {
             "Verify the deployment before requesting work"
         );
         if abi::number(info[3]) >= limit || abi::number(info[6]) != U256::ZERO {
-            return Ok(None);
+            return Ok((None, false));
         }
         // This call also enforces the coordinator's workActive checkpoint.
         // All reads use the same block, so a boundary cannot mix two epochs.
         let target = match self.call_at(d.ledger, "targetForEpoch(uint48)", &[word], height) {
             Ok(value) => abi::scalar(&value)?,
-            Err(error) if work_unavailable(&error) => return Ok(None),
+            Err(error) if work_unavailable(&error) => return Ok((None, false)),
             Err(error) => return Err(error),
         };
         let generation =
@@ -723,7 +824,7 @@ impl Client {
             words[0]
         };
         if seed == B256::ZERO {
-            return Ok(None);
+            return Ok((None, true));
         }
         let work = Work {
             chain_id: d.chain_id,
@@ -742,7 +843,7 @@ impl Client {
             .as_ref()
             .is_some_and(|(previous, who)| previous == &work && *who == beneficiary)
         {
-            return Ok(Some(work));
+            return Ok((Some(work), false));
         }
         let nonce = (U256::from(1) << 128) + U256::from(7);
         let expected = abi::words(&self.call_at(
@@ -756,7 +857,7 @@ impl Client {
             "Miner and ledger digest domains differ"
         );
         *self.validated_work.lock().unwrap() = Some((work.clone(), beneficiary));
-        Ok(Some(work))
+        Ok((Some(work), false))
     }
     pub fn balance(&self, account: Address) -> Result<U256> {
         abi::quantity(
@@ -1111,7 +1212,14 @@ impl Client {
     ) -> Result<Value> {
         let _writer = self.writer.lock().unwrap();
         self.transaction_phase("preflight", label, None);
+        let started = Instant::now();
         let result = self.send_inner(signer, label, to, data, expected);
+        if result.is_ok() && label == "mined-proof" && expected.is_some() {
+            self.inclusion_window
+                .lock()
+                .unwrap()
+                .record(started.elapsed());
+        }
         if result.is_ok() {
             self.transaction_phase("idle", label, None);
         } else {
@@ -1364,6 +1472,30 @@ mod tests {
     use super::*;
     const GAS_PRICE: u128 = 150_000_000_000;
 
+    #[test]
+    fn inclusion_window_learns_verified_transaction_times_conservatively() {
+        let mut window = InclusionWindow::default();
+        assert_eq!(window.margin(), 15);
+        for _ in 0..2 {
+            window.record(Duration::from_secs(2));
+        }
+        assert_eq!(window.margin(), 15);
+        window.record(Duration::from_millis(3100));
+        assert_eq!(window.margin(), 6);
+        assert!(mining_window_open(110, 121, window.margin()));
+        assert!(!mining_window_open(115, 121, window.margin()));
+        window.record(Duration::from_secs(20));
+        assert_eq!(window.margin(), 15);
+        for _ in 0..20 {
+            window.record(Duration::from_secs(1));
+        }
+        assert_eq!(window.samples.len(), 16);
+        assert_eq!(window.margin(), 5);
+        window.observe_route(1);
+        assert!(window.samples.is_empty());
+        assert_eq!(window.margin(), 15);
+    }
+
     fn fixture_manifest() -> Manifest {
         serde_json::from_value(json!({"schema":"zoru-mainnet-suite-1","chainId":CHAIN,"mode":"mainnet",
             "token":Address::repeat_byte(1),"ledger":Address::repeat_byte(2),"engine":Address::repeat_byte(3),
@@ -1380,21 +1512,40 @@ mod tests {
             timestamp: 70,
             beneficiary: Address::repeat_byte(7),
             work: None,
+            beacon_missing: true,
         };
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), Some(1));
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            Some(1)
+        );
         snapshot.timestamp = 106; // Epoch ends at 121, with a 15-second margin.
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            None
+        );
         snapshot.timestamp = 121;
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), Some(2));
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            Some(2)
+        );
         snapshot.timestamp = 104;
         snapshot.observed = Instant::now() - Duration::from_secs(3);
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            None
+        );
         snapshot.timestamp = 70;
         snapshot.observed = Instant::now() - Duration::from_secs(6);
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            None
+        );
         snapshot.observed = Instant::now();
         snapshot.timestamp = 0;
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            None
+        );
         snapshot.timestamp = 70;
         snapshot.work = Some(Work {
             chain_id: CHAIN,
@@ -1406,7 +1557,17 @@ mod tests {
             target: U256::MAX >> 16,
             end_time: 121,
         });
-        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        assert_eq!(
+            snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
+            None
+        );
+        assert!(!snapshot.settlement_window_open(&manifest, 20));
+        snapshot.beacon_missing = false;
+        assert!(snapshot.settlement_window_open(&manifest, 20));
+        snapshot.timestamp = 104;
+        assert!(!snapshot.settlement_window_open(&manifest, 20));
+        snapshot.timestamp = 106;
+        assert_eq!(snapshot.wait_reason(&manifest, 15), "epoch-safety-window");
     }
     fn encoded(words: &[B256]) -> Value {
         json!(format!(
@@ -1739,12 +1900,32 @@ mod tests {
     #[test]
     fn mining_work_closes_at_the_relay_inclusion_safety_margin() {
         let end = 10_000;
-        let cutoff = end - INCLUSION_MARGIN_SECONDS;
-        assert!(mining_window_open(cutoff - 1, end));
-        assert!(!mining_window_open(cutoff, end));
-        assert!(!mining_window_open(cutoff + 1, end));
-        assert!(!mining_window_open(end, end));
-        assert!(!mining_window_open(u64::MAX, end));
+        let cutoff = end - INITIAL_INCLUSION_MARGIN_SECONDS;
+        assert!(mining_window_open(
+            cutoff - 1,
+            end,
+            INITIAL_INCLUSION_MARGIN_SECONDS
+        ));
+        assert!(!mining_window_open(
+            cutoff,
+            end,
+            INITIAL_INCLUSION_MARGIN_SECONDS
+        ));
+        assert!(!mining_window_open(
+            cutoff + 1,
+            end,
+            INITIAL_INCLUSION_MARGIN_SECONDS
+        ));
+        assert!(!mining_window_open(
+            end,
+            end,
+            INITIAL_INCLUSION_MARGIN_SECONDS
+        ));
+        assert!(!mining_window_open(
+            u64::MAX,
+            end,
+            INITIAL_INCLUSION_MARGIN_SECONDS
+        ));
     }
 
     #[test]

@@ -591,8 +591,8 @@ fn setup(args: Setup) -> Result<()> {
     };
     let rpc = match args.rpc {
         Some(value) => value,
-        None if interactive => prompt("EVM RPC endpoint", Some("https://vexascan.com/rpc"))?,
-        None => "https://vexascan.com/rpc".to_owned(),
+        None if interactive => prompt("EVM RPC endpoint", Some("https://api.windcrypto.com/rpc"))?,
+        None => "https://api.windcrypto.com/rpc".to_owned(),
     };
     let state_dir = match args.state_dir {
         Some(value) => value,
@@ -882,7 +882,7 @@ mod tests {
         )));
         let config = SavedConnection {
             manifest: directory.join("deployment.json"),
-            rpc: "https://vexascan.com/rpc".into(),
+            rpc: "https://api.windcrypto.com/rpc".into(),
             wallet: directory.join("wallet.json"),
             state_dir: directory.join("state"),
             workers: 2,
@@ -905,7 +905,7 @@ mod tests {
             "--manifest",
             "deployment.json",
             "--rpc",
-            "https://vexascan.com/rpc",
+            "https://api.windcrypto.com/rpc",
             "--state-dir",
             "state",
         ])
@@ -914,8 +914,11 @@ mod tests {
             panic!("expected mine")
         };
         assert!(connection.native.is_none());
-        assert_eq!(connection.options().read, "https://vexascan.com/rpc");
-        assert_eq!(connection.options().submit, "https://vexascan.com/rpc");
+        assert_eq!(connection.options().read, "https://api.windcrypto.com/rpc");
+        assert_eq!(
+            connection.options().submit,
+            "https://api.windcrypto.com/rpc"
+        );
     }
 
     #[test]
@@ -927,7 +930,7 @@ mod tests {
                 "--manifest",
                 "deployment.json",
                 "--rpc",
-                "https://vexascan.com/rpc",
+                "https://api.windcrypto.com/rpc",
                 "--read",
                 "http://127.0.0.1:18546",
                 "--native",
@@ -955,7 +958,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = SavedConnection {
             manifest: dir.path().join("missing-manifest.json"),
-            rpc: "https://vexascan.com/rpc".into(),
+            rpc: "https://api.windcrypto.com/rpc".into(),
             wallet: dir.path().join("missing-wallet.json"),
             state_dir: dir.path().join("state"),
             workers: default_workers(),
