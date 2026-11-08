@@ -5,7 +5,10 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap},
+    widgets::{
+        Axis, Block, BorderType, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
+        Wrap,
+    },
 };
 use serde_json::Value;
 use std::{
@@ -353,16 +356,7 @@ impl View {
             let block = panel(" HASHRATE / HISTORY ", ascii);
             let inner = block.inner(chart);
             frame.render_widget(block, chart);
-            let data: Vec<u64> = self
-                .rates
-                .iter()
-                .skip(
-                    self.rates
-                        .len()
-                        .saturating_sub(inner.width.saturating_sub(2) as usize),
-                )
-                .copied()
-                .collect();
+            let data: Vec<u64> = self.rates.iter().copied().collect();
             let peak = data.iter().copied().max().unwrap_or(0);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -381,29 +375,12 @@ impl View {
                 Rect::new(inner.x, inner.y, inner.width, 1),
             );
             let plot = Rect::new(
-                inner.right().saturating_sub(1 + data.len() as u16),
+                inner.x + 1,
                 inner.y + 1,
-                data.len() as u16,
+                inner.width.saturating_sub(2),
                 inner.height.saturating_sub(1),
             );
-            let mut graph = Sparkline::default()
-                .data(&data)
-                .max(peak.max(1))
-                .style(Style::default().fg(CYAN));
-            if ascii {
-                graph = graph.bar_set(ratatui::symbols::bar::Set {
-                    full: "#",
-                    seven_eighths: "#",
-                    three_quarters: "*",
-                    five_eighths: "*",
-                    half: "+",
-                    three_eighths: "=",
-                    one_quarter: ":",
-                    one_eighth: ".",
-                    empty: " ",
-                });
-            }
-            frame.render_widget(graph, plot);
+            rate_graph(frame, plot, &data, ascii);
         }
         let remaining = p["epochEndsAt"]
             .as_u64()
@@ -699,6 +676,32 @@ fn panel(title: &str, ascii: bool) -> Block<'_> {
         block
     }
 }
+fn rate_graph(frame: &mut Frame<'_>, area: Rect, rates: &[u64], ascii: bool) {
+    let rates = &rates[rates.len().saturating_sub(60)..];
+    let offset = 60 - rates.len();
+    let points: Vec<(f64, f64)> = rates
+        .iter()
+        .enumerate()
+        .map(|(i, rate)| ((offset + i) as f64, *rate as f64))
+        .collect();
+    let peak = rates.iter().copied().max().unwrap_or(0).max(1) as f64;
+    let dataset = Dataset::default()
+        .data(&points)
+        .graph_type(GraphType::Line)
+        .marker(if ascii {
+            ratatui::symbols::Marker::Custom('*')
+        } else {
+            ratatui::symbols::Marker::Braille
+        })
+        .style(Style::default().fg(CYAN));
+    frame.render_widget(
+        Chart::new(vec![dataset])
+            .x_axis(Axis::default().bounds([0.0, 59.0]))
+            .y_axis(Axis::default().bounds([0.0, peak * 1.15]))
+            .style(Style::default().bg(SURFACE)),
+        area,
+    );
+}
 fn badge(label: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {label} "),
@@ -963,12 +966,10 @@ mod tests {
                     assert!(screen.is_ascii(), "ASCII mode contains Unicode: {screen}");
                 }
                 if !ascii && width == 66 && height >= 32 {
-                    for y in [13, 14] {
-                        assert!(
-                            (1..65).any(|x| buffer[(x, y)].symbol() == "█"),
-                            "Graph needs two visible rows"
-                        );
-                    }
+                    assert!(
+                        (13..15).any(|y| (1..65).any(|x| buffer[(x, y)].symbol() != " ")),
+                        "History must remain visible"
+                    );
                     if height == 63 {
                         assert_eq!(buffer[(0, 50)].symbol(), "│");
                         assert_eq!(buffer[(0, 61)].symbol(), "╰");
@@ -1039,5 +1040,33 @@ mod tests {
         view.key(KeyCode::Char('l'));
         assert_eq!(view.visible_event_count(), 3);
         assert_eq!(view.scroll, 0);
+    }
+
+    #[test]
+    fn rate_line_connects_hashing_waiting_and_resuming_without_hiding_zero() {
+        let rates: Vec<u64> = [vec![300_000; 20], vec![0; 20], vec![500_000; 20]].concat();
+        for ascii in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(64, 2)).unwrap();
+            terminal
+                .draw(|f| rate_graph(f, f.area(), &rates, ascii))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for x in 0..64 {
+                assert!(
+                    (0..2).any(|y| !matches!(buffer[(x, y)].symbol(), " " | "⠀")),
+                    "Disconnected history at column {x}"
+                );
+            }
+            terminal
+                .draw(|f| rate_graph(f, f.area(), &[0; 60], ascii))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for x in 0..64 {
+                assert!(
+                    !matches!(buffer[(x, 1)].symbol(), " " | "⠀"),
+                    "Zero rate must remain visible on the baseline"
+                );
+            }
+        }
     }
 }

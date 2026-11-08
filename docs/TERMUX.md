@@ -62,8 +62,10 @@ Android may suspend Termux in the background; a foreground terminal and a
 Termux wake lock can help, subject to the device's battery restrictions.
 
 The dashboard uses colored status badges, compact balance cards and a
-dedicated hashrate panel with the current rate, measured peak and a two-row
-history graph. New samples arrive at the right edge. Phone screens use two columns;
+dedicated hashrate panel with the current rate, measured peak and a connected
+two-row history line. A real zero rate stays visible on the baseline; the
+graph leaves headroom above peaks. New samples arrive at the right edge.
+Phone screens use two columns;
 wider terminals show network and engine details side by side. `--ascii`
 uses ASCII glyphs for borders and the trend graph. Uptime appears once in
 the session panel. The main activity feed focuses on epoch changes,
