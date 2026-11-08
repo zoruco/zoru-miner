@@ -371,13 +371,17 @@ impl WorkSnapshot {
         let now = self.timestamp.checked_add(age.as_secs())?;
         mining_window_open(now, end, margin).then_some(epoch)
     }
-    fn wait_reason(&self, manifest: &Manifest, margin: u64) -> &'static str {
+    fn wait_reason(&self, manifest: &Manifest) -> &'static str {
         let age = self.observed.elapsed();
         if age >= Duration::from_secs(WORK_LEASE_SECONDS) {
             return "stale-work-lease";
         }
-        if let Some((_, end)) = self.epoch_window(manifest)
-            && !mining_window_open(self.timestamp.saturating_add(age.as_secs()), end, margin)
+        if let Some(end) = self
+            .work
+            .as_ref()
+            .map(|work| work.end_time)
+            .or_else(|| self.epoch_window(manifest).map(|(_, end)| end))
+            && !mining_window_open(self.timestamp.saturating_add(age.as_secs()), end, 0)
         {
             return "epoch-safety-window";
         }
@@ -676,12 +680,18 @@ impl Client {
         Ok(n.try_into()?)
     }
     pub fn work_deadline(&self) -> Option<Instant> {
+        self.deadline(0)
+    }
+    pub fn submission_deadline(&self) -> Option<Instant> {
+        self.deadline(self.inclusion_margin())
+    }
+    fn deadline(&self, margin: u64) -> Option<Instant> {
         self.work_snapshot.lock().unwrap().as_ref().and_then(|s| {
             s.work.as_ref().map(|w| {
                 s.observed
                     + Duration::from_secs(
                         w.end_time
-                            .saturating_sub(self.inclusion_margin())
+                            .saturating_sub(margin)
                             .saturating_sub(s.timestamp)
                             .min(WORK_LEASE_SECONDS),
                     )
@@ -712,9 +722,7 @@ impl Client {
             .lock()
             .unwrap()
             .as_ref()
-            .map_or("refreshing-work", |s| {
-                s.wait_reason(&self.manifest, self.inclusion_margin())
-            })
+            .map_or("refreshing-work", |s| s.wait_reason(&self.manifest))
     }
     fn observe_head(&self, height: u64) -> Result<()> {
         let mut previous = self.head.lock().unwrap();
@@ -784,7 +792,7 @@ impl Client {
         }
         let epoch = (now - d.launch_time) / d.epoch_seconds;
         let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
-        if !mining_window_open(now, end_time, self.inclusion_margin()) {
+        if !mining_window_open(now, end_time, 0) {
             return Ok((None, false));
         }
         if abi::boolean(&self.call_at(d.ledger, "admissionPaused()", &[], height)?)? {
@@ -1162,7 +1170,7 @@ impl Client {
                         expected.epoch == epoch
                             && self.work(account)?.as_ref() == Some(expected)
                             && self
-                                .work_deadline()
+                                .submission_deadline()
                                 .is_some_and(|deadline| Instant::now() < deadline),
                         "Signed proof work has changed; retain the journal without rebroadcasting"
                     );
@@ -1308,7 +1316,7 @@ impl Client {
                 generation == work.generation
                     && self.work(signer.address())?.as_ref() == Some(work)
                     && self
-                        .work_deadline()
+                        .submission_deadline()
                         .is_some_and(|deadline| Instant::now() < deadline),
                 "STALE_WORK: epoch, seed, target, generation or admission changed"
             );
@@ -1343,7 +1351,7 @@ impl Client {
             ensure!(
                 self.work(account)?.as_ref() == Some(work)
                     && self
-                        .work_deadline()
+                        .submission_deadline()
                         .is_some_and(|deadline| Instant::now() < deadline),
                 "STALE_WORK: work changed or inclusion window closing"
             );
@@ -1423,7 +1431,7 @@ impl Client {
                     ensure!(
                         self.work(account)?.as_ref() == Some(work)
                             && self
-                                .work_deadline()
+                                .submission_deadline()
                                 .is_some_and(|deadline| Instant::now() < deadline),
                         "STALE_WORK: retry context expired; retain the signed journal"
                     );
@@ -1567,7 +1575,7 @@ mod tests {
         snapshot.timestamp = 104;
         assert!(!snapshot.settlement_window_open(&manifest, 20));
         snapshot.timestamp = 106;
-        assert_eq!(snapshot.wait_reason(&manifest, 15), "epoch-safety-window");
+        assert_eq!(snapshot.wait_reason(&manifest), "none");
     }
     fn encoded(words: &[B256]) -> Value {
         json!(format!(
@@ -1663,6 +1671,20 @@ mod tests {
             "the second read must use the block cache"
         );
         assert!(c.work_deadline().unwrap() <= Instant::now() + Duration::from_secs(5));
+        // A fresh, valid job keeps hashing inside the signing guard. No RPC
+        // is needed to reject a candidate that cannot be included in time.
+        {
+            let mut snapshot = c.work_snapshot.lock().unwrap();
+            let snapshot = snapshot.as_mut().unwrap();
+            snapshot.timestamp = 120;
+            snapshot.observed = Instant::now();
+        }
+        assert!(c.work_deadline().unwrap() > Instant::now());
+        assert!(c.submission_deadline().unwrap() <= Instant::now());
+        assert_eq!(c.work_wait_reason(), "none");
+        c.work_snapshot.lock().unwrap().as_mut().unwrap().timestamp = 121;
+        assert!(c.work_deadline().unwrap() <= Instant::now());
+        assert_eq!(c.work_wait_reason(), "epoch-safety-window");
         server.join().unwrap();
     }
     #[test]

@@ -1379,7 +1379,12 @@ impl Session {
                         // Drop those results here instead of logging each one
                         // as an individual stale-work warning. submit_candidate
                         // retains its own guard for races after this check.
-                        if run.work.read().unwrap().as_ref() != Some(&candidate.work) {
+                        if run.work.read().unwrap().as_ref() != Some(&candidate.work)
+                            || run
+                                .client
+                                .submission_deadline()
+                                .is_none_or(|deadline| Instant::now() >= deadline)
+                        {
                             set_counter(&mut run.stats.lock().unwrap(), "staleBeforeBroadcast", 1);
                         } else if options.dry_run {
                             set_counter(&mut run.stats.lock().unwrap(), "dryRunCandidates", 1);
@@ -1511,6 +1516,11 @@ impl Session {
                 break;
             }
             stats["waitReason"] = json!(self.client.work_wait_reason());
+            stats["submissionOpen"] = json!(
+                self.client
+                    .submission_deadline()
+                    .is_some_and(|deadline| Instant::now() < deadline)
+            );
             stats["status"] = json!(if self.pause.load(Ordering::Relaxed) {
                 "paused"
             } else if blocked {
