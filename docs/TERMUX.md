@@ -64,7 +64,11 @@ Termux wake lock can help, subject to the device's battery restrictions.
 The dashboard uses colored status badges, balance cards and a rolling graph
 of measured hashrate. Phone screens use two columns; wider terminals show
 network and engine details side by side. `--ascii` keeps all dashboard glyphs
-ASCII and shows a throughput label instead of the graph.
+ASCII and omits the graph. Uptime appears once in the session panel. The
+activity feed omits hashing and queue transitions already shown in live
+metrics, and combines identical warnings or errors into one row with an
+occurrence count. Distinct proof receipts remain separate events. Raw JSON
+output from `--plain` retains the full engine event stream.
 
 If the dashboard has no colors, check whether the shell or a tmux server
 inherited `NO_COLOR`. Enable colors for just this process with:

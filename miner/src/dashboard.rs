@@ -32,6 +32,7 @@ struct MiningEvent {
     time: String,
     category: String,
     message: String,
+    repeats: u64,
 }
 
 #[derive(Default)]
@@ -100,6 +101,12 @@ impl View {
         }
     }
     fn push(&mut self, category: &str, message: &str) {
+        // These transitions already have live indicators in the header and queue.
+        if matches!(category, "HASHING" | "QUEUED")
+            || (category == "WARNING" && message == "waiting-beacon-or-recovery")
+        {
+            return;
+        }
         let message: String = message
             .chars()
             .filter(|c| !c.is_control())
@@ -116,7 +123,17 @@ impl View {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        // An unavailable RPC may repeat the same error on every work refresh.
+        if matches!(category, "WARNING" | "ERROR")
+            && let Some(event) = self
+                .events
+                .iter_mut()
+                .rev()
+                .find(|e| e.category == category && e.message == message)
+        {
+            event.repeats = event.repeats.saturating_add(1);
+            return;
+        }
+        // Exact consecutive copies of other events need only one row.
         if self
             .events
             .back()
@@ -133,6 +150,7 @@ impl View {
                 .to_string(),
             category: category.to_owned(),
             message,
+            repeats: 1,
         });
         if self.events.len() > LIMIT {
             self.events.pop_front();
@@ -218,13 +236,10 @@ impl View {
             ]),
         ];
         if !compact {
-            header.push(Line::from(vec![
-                Span::styled(
-                    format!(" {}", short(text(&s["address"]), ascii)),
-                    Style::default().fg(INK),
-                ),
-                Span::styled(format!("   UP {uptime}"), Style::default().fg(MUTED)),
-            ]));
+            header.push(Line::from(vec![Span::styled(
+                format!(" {}", short(text(&s["address"]), ascii)),
+                Style::default().fg(INK),
+            )]));
         }
         frame.render_widget(
             Paragraph::new(header).block(panel("", ascii).border_style(Style::default().fg(CYAN))),
@@ -251,24 +266,17 @@ impl View {
                     .copied(),
             );
         }
-        for (i, (label, value, note, color)) in [
-            (
-                " VEX / GAS ",
-                amount(&p["nativeBalanceWei"], 18),
-                "VEX available",
-                INK,
-            ),
+        for (i, (label, value, color)) in [
+            (" VEX / GAS ", amount(&p["nativeBalanceWei"], 18), INK),
             (
                 " ZORU / WALLET ",
                 amount(&p["tokenBalanceBaseUnits"], 8),
-                "ZORU balance",
                 GOLD,
             ),
-            (" REWARDS ", unclaimed, "ZORU unclaimed", GOLD),
+            (" UNCLAIMED / ZORU ", unclaimed, GOLD),
             (
                 " HASHRATE ",
                 hashrate(s["hashesPerSecond"].as_f64().unwrap_or(0.0)),
-                "measured throughput",
                 CYAN,
             ),
         ]
@@ -290,17 +298,10 @@ impl View {
             let inner = block.inner(cards[i]);
             frame.render_widget(block, cards[i]);
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(format!(" {value}"), Style::default().fg(color).bold()),
-                    Line::styled(
-                        if i == 3 && !ascii {
-                            String::new()
-                        } else {
-                            format!(" {note}")
-                        },
-                        Style::default().fg(MUTED),
-                    ),
-                ]),
+                Paragraph::new(vec![Line::styled(
+                    format!(" {value}"),
+                    Style::default().fg(color).bold(),
+                )]),
                 inner,
             );
             if i == 3 && !ascii && inner.height >= 2 && inner.width >= 8 {
@@ -403,6 +404,7 @@ impl View {
                         CYAN,
                     ),
                     ("Pending TX", display(&s["pendingTransactions"]), GOLD),
+                    ("Uptime", uptime.clone(), INK),
                     (
                         "TX pipeline",
                         display(&s["transactionPipeline"]["status"]),
@@ -501,6 +503,22 @@ impl View {
             .take(end)
             .skip(end.saturating_sub(visible))
             .map(|e| {
+                let message = match e.category.as_str() {
+                    "FOUND" => e
+                        .message
+                        .strip_prefix("Valid local candidate · nonce ")
+                        .map(|nonce| format!("Nonce {}", short(nonce, ascii))),
+                    "EPOCH" => e
+                        .message
+                        .strip_prefix("Work activated · epoch ")
+                        .map(str::to_owned),
+                    "ACCEPTED" => e
+                        .message
+                        .strip_prefix("Proof confirmed in block ")
+                        .map(|block| format!("Block {block}")),
+                    _ => None,
+                }
+                .unwrap_or_else(|| e.message.clone());
                 let color = match e.category.as_str() {
                     "HASHING" | "FOUND" | "ACCEPTED" => GREEN,
                     "CLAIM" => GOLD,
@@ -521,11 +539,18 @@ impl View {
                         Style::default().fg(MUTED),
                     ),
                     badge(&format!("{:<8}", e.category), color),
-                    Span::raw(" "),
+                    Span::styled(
+                        if e.repeats > 1 {
+                            format!(" x{} ", e.repeats)
+                        } else {
+                            " ".into()
+                        },
+                        Style::default().fg(GOLD),
+                    ),
                     Span::raw(if ascii {
-                        e.message.replace('·', "|").replace('…', "...")
+                        message.replace('·', "|").replace('…', "...")
                     } else {
-                        e.message.clone()
+                        message
                     }),
                 ])
             })
@@ -831,6 +856,15 @@ mod tests {
                         "{width}x{height} missing {expected}:\n{screen}"
                     );
                 }
+                assert!(!screen.contains("VEX available"));
+                assert!(!screen.contains("ZORU balance"));
+                if height >= 28 {
+                    assert_eq!(
+                        screen.matches("01:00:01").count(),
+                        1,
+                        "Uptime must appear once: {screen}"
+                    );
+                }
                 assert!(buffer.content().iter().any(|c| c.bg == GREEN && c.fg == BG));
                 assert!(buffer.content().iter().any(|c| c.fg == CYAN));
                 if ascii {
@@ -859,5 +893,22 @@ mod tests {
         view.sampled = None;
         view.receive(json!({"event":"state","data":{}}));
         assert_eq!(view.rates.len(), 60);
+    }
+
+    #[test]
+    fn activity_coalesces_repeated_warnings_but_keeps_distinct_receipts() {
+        let mut view = View::default();
+        view.push("HASHING", "mining");
+        view.push("QUEUED", "Candidate awaiting the transaction writer");
+        view.push("WARNING", "waiting-beacon-or-recovery");
+        assert!(view.events.is_empty());
+        view.push("WARNING", "Submission response: RPC timeout");
+        view.push("ACCEPTED", "Proof confirmed in block 100");
+        view.push("WARNING", "Submission response: RPC timeout");
+        view.push("ACCEPTED", "Proof confirmed in block 101");
+        assert_eq!(view.events.len(), 3);
+        assert_eq!(view.events[0].repeats, 2);
+        assert_eq!(view.events[1].repeats, 1);
+        assert_eq!(view.events[2].message, "Proof confirmed in block 101");
     }
 }
