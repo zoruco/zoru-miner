@@ -37,6 +37,7 @@ pub const REORG_WINDOW: u64 = 128;
 // Mainnet relay inclusion observed during validation took up to ten seconds.
 // Retain a further five seconds before a proof's 60-second epoch closes.
 const INCLUSION_MARGIN_SECONDS: u64 = 15;
+const WORK_LEASE_SECONDS: u64 = 5;
 
 fn mining_window_open(now: u64, end_time: u64) -> bool {
     now < end_time.saturating_sub(INCLUSION_MARGIN_SECONDS)
@@ -311,6 +312,24 @@ struct WorkSnapshot {
     timestamp: u64,
     beneficiary: Address,
     work: Option<Work>,
+}
+
+impl WorkSnapshot {
+    fn pending_beacon_epoch(&self, manifest: &Manifest) -> Option<u64> {
+        let age = self.observed.elapsed();
+        if self.work.is_some() || age >= Duration::from_secs(WORK_LEASE_SECONDS) {
+            return None;
+        }
+        let epoch = self
+            .timestamp
+            .checked_sub(manifest.launch_time)?
+            .checked_div(manifest.epoch_seconds)?;
+        let end = manifest
+            .launch_time
+            .checked_add(epoch.checked_add(1)?.checked_mul(manifest.epoch_seconds)?)?;
+        let now = self.timestamp.checked_add(age.as_secs())?;
+        mining_window_open(now, end).then_some(epoch)
+    }
 }
 
 pub struct Client {
@@ -590,10 +609,17 @@ impl Client {
                         w.end_time
                             .saturating_sub(INCLUSION_MARGIN_SECONDS)
                             .saturating_sub(s.timestamp)
-                            .min(5),
+                            .min(WORK_LEASE_SECONDS),
                     )
             })
         })
+    }
+    pub(crate) fn pending_beacon_epoch(&self) -> Option<u64> {
+        self.work_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .pending_beacon_epoch(&self.manifest)
     }
     fn observe_head(&self, height: u64) -> Result<()> {
         let mut previous = self.head.lock().unwrap();
@@ -1344,6 +1370,43 @@ mod tests {
             "beacon":Address::repeat_byte(4),"admin":Address::repeat_byte(5),"owner":Address::repeat_byte(6),
             "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
             "drandChainHash":DRAND_HASH,"runtimeCodeHashes":{},"approvedImplementationCodeHashes":{},"manifestSha256":"fixture"})).unwrap()
+    }
+    #[test]
+    fn beacon_retry_uses_fresh_missing_work_and_skips_closed_windows() {
+        let manifest = fixture_manifest();
+        let mut snapshot = WorkSnapshot {
+            block: B256::repeat_byte(9),
+            observed: Instant::now(),
+            timestamp: 70,
+            beneficiary: Address::repeat_byte(7),
+            work: None,
+        };
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), Some(1));
+        snapshot.timestamp = 106; // Epoch ends at 121, with a 15-second margin.
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        snapshot.timestamp = 121;
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), Some(2));
+        snapshot.timestamp = 104;
+        snapshot.observed = Instant::now() - Duration::from_secs(3);
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        snapshot.timestamp = 70;
+        snapshot.observed = Instant::now() - Duration::from_secs(6);
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        snapshot.observed = Instant::now();
+        snapshot.timestamp = 0;
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
+        snapshot.timestamp = 70;
+        snapshot.work = Some(Work {
+            chain_id: CHAIN,
+            ledger: manifest.ledger,
+            token: manifest.token,
+            generation: U256::from(1),
+            epoch: 1,
+            seed: B256::repeat_byte(8),
+            target: U256::MAX >> 16,
+            end_time: 121,
+        });
+        assert_eq!(snapshot.pending_beacon_epoch(&manifest), None);
     }
     fn encoded(words: &[B256]) -> Value {
         json!(format!(

@@ -10,6 +10,8 @@ The existing hashing workers send candidates through a bounded 64-entry channel 
 
 The Ledger accepts multiple proofs per epoch without changing that epoch's target or seed after each submission. Inclusion must occur in the current epoch with active coordinated work, open admission, a valid issuer, an unused digest below the strict target and available proof capacity. The first proof also requires emission capacity. Once stored, the Ledger's seed takes precedence over the beacon cache; upgrades can change the generation and clear that stored seed. Proofs carry their complete work context and are discarded if it changes. A 15-second inclusion margin is retained. Workers also stop when their locally timed work lease expires, including when an RPC stops advancing.
 
+Beacon retries reuse the work poller's fresh block snapshot to select the epoch. They run only when work is unavailable and the inclusion window is still open. A closed window or stale snapshot does not trigger redundant beacon lookups. Publication retains its own on-chain epoch, seed and admission checks.
+
 The terminal dashboard and desktop consume shared session snapshots and events. Rendering never calls RPC or runs mining. Wallet/global snapshots refresh every 15 seconds independently of work and transaction handling; the desktop's standalone monitor runs only outside an active session. The terminal retains 512 events, redraws at most five times per second and falls back to JSON without a TTY. If proof or claim history changes while a snapshot is collected, personal totals remain unavailable until the next consistent refresh. RPC counters, queue bounds, stale candidates, CPU use and receipt latency are measured by the shared backend.
 
 ## Wallet and transaction recovery

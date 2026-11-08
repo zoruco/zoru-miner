@@ -1272,10 +1272,10 @@ impl Session {
                     && run.work.read().unwrap().is_none()
                     && Instant::now() >= beacon_retry
                 {
-                    if let Err(error) = run
-                        .client
-                        .epoch()
-                        .and_then(|epoch| run.publish_beacon(epoch))
+                    // The poller's fresh block already identifies the epoch.
+                    // Do not retry beacon reads after the inclusion window closes.
+                    if let Some(epoch) = run.client.pending_beacon_epoch()
+                        && let Err(error) = run.publish_beacon(epoch)
                     {
                         run.error(error, false);
                     }
