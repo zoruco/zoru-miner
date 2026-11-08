@@ -831,16 +831,10 @@ impl Session {
     fn prepare_beacon(&self, epoch: u64) -> Result<Option<PreparedBeacon>> {
         let c = &self.client;
         let d = &c.manifest;
-        if c.epoch()? != epoch {
-            return Ok(None);
-        }
+        // The work poller's fresh snapshot already established open admission
+        // and a missing seed. Authentication below executes publish via eth_call;
+        // the sole writer rechecks the epoch, seed and round before signing.
         let word = abi::uint(U256::from(epoch));
-        if abi::scalar(&c.call(d.beacon, "verifiedSeed(uint48)", &[word])?)? != U256::ZERO {
-            return Ok(None);
-        }
-        if c.number(d.ledger, "admissionPaused()")? != U256::ZERO {
-            return Ok(None);
-        }
         let round = abi::scalar(&c.call(d.beacon, "expectedRound(uint48)", &[word])?)?;
         let fetched = fetch_scheduled_beacon(
             &["https://api.drand.sh", "https://api2.drand.sh"],
@@ -859,9 +853,6 @@ impl Session {
                 return Err(error);
             }
         };
-        if c.epoch()? != epoch {
-            return Ok(None);
-        }
         Ok(Some(PreparedBeacon {
             epoch,
             round,
