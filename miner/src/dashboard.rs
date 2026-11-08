@@ -2,10 +2,10 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table},
 };
 use serde_json::Value;
 use std::{
@@ -17,7 +17,11 @@ use std::{
 };
 use zoru_miner::session::Session;
 
-const BG: Color = Color::Rgb(8, 13, 24);
+const BG: Color = Color::Rgb(10, 15, 25);
+const SURFACE: Color = Color::Rgb(16, 23, 36);
+const EDGE: Color = Color::Rgb(41, 57, 78);
+const INK: Color = Color::Rgb(228, 236, 247);
+const RED: Color = Color::Rgb(255, 113, 133);
 const CYAN: Color = Color::Rgb(60, 210, 230);
 const MUTED: Color = Color::Rgb(135, 151, 173);
 const GREEN: Color = Color::Rgb(97, 220, 145);
@@ -38,6 +42,8 @@ pub struct View {
     events: VecDeque<MiningEvent>,
     scroll: usize,
     logs: bool,
+    rates: VecDeque<u64>,
+    sampled: Option<Instant>,
 }
 
 pub fn enabled(plain: bool, stdin: bool, stdout: bool, term: Option<&str>) -> bool {
@@ -56,7 +62,20 @@ pub fn available(plain: bool) -> bool {
 impl View {
     pub fn receive(&mut self, value: Value) {
         match value["event"].as_str().unwrap_or_default() {
-            "state" | "mine-result" => self.state = value["data"].clone(),
+            "state" | "mine-result" => {
+                self.state = value["data"].clone();
+                if self
+                    .sampled
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                    && let Some(rate) = self.state["hashesPerSecond"].as_f64()
+                {
+                    self.rates.push_back(rate.max(0.0) as u64);
+                    if self.rates.len() > 60 {
+                        self.rates.pop_front();
+                    }
+                    self.sampled = Some(Instant::now());
+                }
+            }
             "inspection" => {
                 self.inspection = value["data"].clone();
                 self.inspected = Some(Instant::now());
@@ -135,284 +154,348 @@ impl View {
     fn draw(&self, frame: &mut Frame<'_>, ascii: bool) {
         let area = frame.area();
         frame.render_widget(
-            Block::default().style(Style::default().bg(BG).fg(Color::White)),
+            Block::default().style(Style::default().bg(BG).fg(INK)),
             area,
         );
-        let compact = area.height < 24 || area.width < 80;
-        let rows = Layout::vertical(if compact {
-            vec![
-                Constraint::Length(4),
-                Constraint::Length(3),
-                Constraint::Length(4),
-                Constraint::Min(2),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![
-                Constraint::Length(4),
-                Constraint::Length(4),
-                Constraint::Length(11),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ]
-        })
+        let wide = area.width >= 100;
+        let compact = area.height < 28;
+        let rows = Layout::vertical([
+            Constraint::Length(if compact { 4 } else { 5 }),
+            Constraint::Length(if wide || compact { 4 } else { 8 }),
+            Constraint::Length(if compact {
+                5
+            } else if wide {
+                11
+            } else {
+                7
+            }),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(area);
-        let state = &self.state;
-        let snapshot = &self.inspection;
-        let phase = match text(&state["status"]) {
-            "mining" => "HASHING",
-            "paused" | "paused-resource" => "PAUSED",
-            "rpc-degraded" => "RPC DEGRADED",
-            "stopped" => "STOPPED",
-            "stopping" => "STOPPING",
-            _ => "WORK REFRESH",
+        let s = &self.state;
+        let p = &self.inspection;
+        let (phase, color) = match text(&s["status"]) {
+            "mining" => ("HASHING", GREEN),
+            "paused" | "paused-resource" => ("PAUSED", GOLD),
+            "rpc-degraded" => ("RPC DEGRADED", RED),
+            "stopped" => ("STOPPED", MUTED),
+            "stopping" => ("STOPPING", GOLD),
+            _ => ("WAITING FOR WORK", GOLD),
         };
-        let rpc = if state["rpcHealthy"] == false {
-            "DEGRADED"
-        } else if self.inspected.is_some() {
-            "HEALTHY"
+        let (rpc, rpc_color) = if s["rpcHealthy"] == false {
+            ("RPC DEGRADED", RED)
+        } else if s["rpcHealthy"] == true || self.inspected.is_some() {
+            ("RPC ONLINE", GREEN)
         } else {
-            "CONNECTING"
+            ("RPC CONNECTING", MUTED)
         };
-        let network = match state["deploymentMode"].as_str() {
-            Some("local") => "ISOLATED EVM",
-            Some("mainnet") => "VEXANIUM EVM / MAINNET",
-            _ => "VEXANIUM EVM",
+        let elapsed = s["elapsedSeconds"].as_f64().unwrap_or(0.0).max(0.0) as u64;
+        let uptime = format!(
+            "{:02}:{:02}:{:02}",
+            elapsed / 3600,
+            elapsed / 60 % 60,
+            elapsed % 60
+        );
+        let network = if s["deploymentMode"] == "local" {
+            "ISOLATED"
+        } else {
+            "MAINNET"
         };
-        let header = vec![
+        let mut header = vec![
             Line::from(vec![
+                Span::styled(" ZORU MINER ", Style::default().fg(CYAN).bold()),
                 Span::styled(
-                    " ZORU MINER",
-                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(
-                    "   {network}   Chain {}",
-                    display(&state["chainId"])
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!(" {phase}"),
-                    Style::default().fg(if phase == "HASHING" {
-                        GREEN
-                    } else {
-                        Color::Yellow
-                    }),
-                ),
-                Span::styled(
-                    format!(
-                        "   RPC {rpc}   Wallet {}",
-                        short(text(&state["address"]), ascii)
-                    ),
+                    format!(" {network} / Chain {}", display(&s["chainId"])),
                     Style::default().fg(MUTED),
                 ),
             ]),
+            Line::from(vec![
+                Span::raw(" "),
+                badge(phase, color),
+                Span::raw("  "),
+                badge(rpc, rpc_color),
+            ]),
         ];
-        frame.render_widget(Paragraph::new(header).block(panel("", ascii)), rows[0]);
-        let unclaimed = if snapshot["myRewardsHistoryComplete"] == true {
-            amount(&snapshot["myUnclaimedBaseUnits"], 8)
+        if !compact {
+            header.push(Line::from(vec![
+                Span::styled(
+                    format!(" {}", short(text(&s["address"]), ascii)),
+                    Style::default().fg(INK),
+                ),
+                Span::styled(format!("   UP {uptime}"), Style::default().fg(MUTED)),
+            ]));
+        }
+        frame.render_widget(
+            Paragraph::new(header).block(panel("", ascii).border_style(Style::default().fg(CYAN))),
+            rows[0],
+        );
+        let unclaimed = if p["myRewardsHistoryComplete"] == true {
+            amount(&p["myUnclaimedBaseUnits"], 8)
         } else {
-            "N/A (syncing)".into()
+            "Syncing".into()
         };
-        let metrics = if compact { 2 } else { 4 };
-        let cells = Layout::default()
-            .direction(if compact {
-                Direction::Vertical
-            } else {
-                Direction::Horizontal
-            })
-            .constraints(vec![Constraint::Ratio(1, metrics); metrics as usize])
-            .split(rows[1]);
-        if compact {
-            frame.render_widget(
-                Paragraph::new(format!(
-                    " VEX {}   ZORU {}",
-                    amount(&snapshot["nativeBalanceWei"], 18),
-                    amount(&snapshot["tokenBalanceBaseUnits"], 8)
-                ))
-                .style(Style::default().fg(GOLD)),
-                cells[0],
-            );
-            frame.render_widget(
-                Paragraph::new(format!(
-                    " Unclaimed {unclaimed}   {}",
-                    hashrate(state["hashesPerSecond"].as_f64().unwrap_or(0.0))
-                ))
-                .style(Style::default().fg(GREEN)),
-                cells[1],
-            );
+        let strips = Layout::vertical(if wide {
+            vec![Constraint::Percentage(100)]
         } else {
-            for (index, (label, value, color)) in [
-                (
-                    " VEX BALANCE",
-                    format!("{} VEX", amount(&snapshot["nativeBalanceWei"], 18)),
-                    Color::White,
-                ),
-                (
-                    " ZORU BALANCE",
-                    format!("{} ZORU", amount(&snapshot["tokenBalanceBaseUnits"], 8)),
-                    GOLD,
-                ),
-                (" UNCLAIMED", format!("{unclaimed} ZORU"), GOLD),
-                (
-                    " HASHRATE",
-                    hashrate(state["hashesPerSecond"].as_f64().unwrap_or(0.0)),
-                    GREEN,
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            vec![Constraint::Percentage(50); 2]
+        })
+        .split(rows[1]);
+        let count = if wide { 4 } else { 2 };
+        let mut cards = Vec::new();
+        for strip in strips.iter() {
+            cards.extend(
+                Layout::horizontal(vec![Constraint::Ratio(1, count); count as usize])
+                    .split(*strip)
+                    .iter()
+                    .copied(),
+            );
+        }
+        for (i, (label, value, note, color)) in [
+            (
+                " VEX / GAS ",
+                amount(&p["nativeBalanceWei"], 18),
+                "VEX available",
+                INK,
+            ),
+            (
+                " ZORU / WALLET ",
+                amount(&p["tokenBalanceBaseUnits"], 8),
+                "ZORU balance",
+                GOLD,
+            ),
+            (" REWARDS ", unclaimed, "ZORU unclaimed", GOLD),
+            (
+                " HASHRATE ",
+                hashrate(s["hashesPerSecond"].as_f64().unwrap_or(0.0)),
+                "measured throughput",
+                CYAN,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if compact && !wide {
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::styled(label, Style::default().fg(MUTED)),
-                        Line::styled(
-                            format!(" {value}"),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        ),
+                        Line::styled(format!(" {value}"), Style::default().fg(color).bold()),
                     ])
-                    .block(panel("", ascii)),
-                    cells[index],
+                    .style(Style::default().bg(SURFACE)),
+                    cards[i],
+                );
+                continue;
+            }
+            let block = panel(label, ascii);
+            let inner = block.inner(cards[i]);
+            frame.render_widget(block, cards[i]);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(format!(" {value}"), Style::default().fg(color).bold()),
+                    Line::styled(
+                        if i == 3 && !ascii {
+                            String::new()
+                        } else {
+                            format!(" {note}")
+                        },
+                        Style::default().fg(MUTED),
+                    ),
+                ]),
+                inner,
+            );
+            if i == 3 && !ascii && inner.height >= 2 && inner.width >= 8 {
+                let data: Vec<u64> = self
+                    .rates
+                    .iter()
+                    .skip(
+                        self.rates
+                            .len()
+                            .saturating_sub(inner.width.saturating_sub(2) as usize),
+                    )
+                    .copied()
+                    .collect();
+                frame.render_widget(
+                    Sparkline::default()
+                        .data(&data)
+                        .style(Style::default().fg(CYAN)),
+                    Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
                 );
             }
         }
-        let tx = &state["transactionPipeline"];
-        let uptime = state["elapsedSeconds"].as_f64().unwrap_or(0.0).max(0.0) as u64;
-        if compact {
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(format!(
-                        " Epoch {}  Workers {}  CPU {}",
-                        display(&snapshot["currentEpoch"]),
-                        display(&state["workers"]),
-                        display(&state["cpuBudgetCores"])
-                    )),
-                    Line::from(format!(
-                        " Accepted {}  Rejected {}  Queue {}",
-                        display(&state["accepted"]),
-                        display(&state["rejected"]),
-                        display(&state["candidateQueueDepth"])
-                    )),
-                ])
-                .block(panel(" ENGINE / CONTRACT", ascii)),
-                rows[2],
+        let remaining = p["epochEndsAt"]
+            .as_u64()
+            .zip(
+                p["blockTimestamp"]
+                    .as_str()
+                    .and_then(|v| v.parse::<u64>().ok()),
+            )
+            .map(|(end, time)| {
+                format!(
+                    "{}s",
+                    end.saturating_sub(time + self.inspected.map_or(0, |t| t.elapsed().as_secs()))
+                )
+            })
+            .unwrap_or("N/A".into());
+        if wide {
+            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[2]);
+            details(
+                frame,
+                cols[0],
+                " NETWORK / EPOCH ",
+                vec![
+                    ("Epoch", display(&p["currentEpoch"]), CYAN),
+                    (
+                        "Target",
+                        p["target"]
+                            .as_str()
+                            .and_then(|v| zoru_miner::abi::quantity(v).ok())
+                            .map(|v| short(&format!("{v:#066x}"), ascii))
+                            .unwrap_or("N/A".into()),
+                        MUTED,
+                    ),
+                    ("Epoch proofs", display(&p["currentEpochProofs"]), INK),
+                    (
+                        "Epoch budget",
+                        format!("{} ZORU", amount(&p["currentEpochBudgetBaseUnits"], 8)),
+                        GOLD,
+                    ),
+                    ("Time remaining", remaining, INK),
+                    ("Generation", display(&p["generation"]), INK),
+                    ("Seed", short(text(&p["seed"]), ascii), MUTED),
+                    ("Total proofs", display(&p["totalAcceptedProofs"]), INK),
+                    (
+                        "Snapshot age",
+                        self.inspected
+                            .map_or("N/A".into(), |t| format!("{}s", t.elapsed().as_secs())),
+                        MUTED,
+                    ),
+                ],
+                ascii,
+            );
+            details(
+                frame,
+                cols[1],
+                " SESSION / ENGINE ",
+                vec![
+                    ("Accepted", display(&s["accepted"]), GREEN),
+                    (
+                        "Rejected",
+                        display(&s["rejected"]),
+                        if s["rejected"].as_u64().unwrap_or(0) > 0 {
+                            RED
+                        } else {
+                            MUTED
+                        },
+                    ),
+                    (
+                        "Workers / CPU",
+                        format!(
+                            "{} / {} cores",
+                            display(&s["workers"]),
+                            display(&s["cpuBudgetCores"])
+                        ),
+                        INK,
+                    ),
+                    (
+                        "Candidate queue",
+                        format!("{} / 64", display(&s["candidateQueueDepth"])),
+                        CYAN,
+                    ),
+                    ("Pending TX", display(&s["pendingTransactions"]), GOLD),
+                    (
+                        "TX pipeline",
+                        display(&s["transactionPipeline"]["status"]),
+                        INK,
+                    ),
+                    (
+                        "Auto-claim",
+                        format!(
+                            "{} / {}",
+                            display(&s["autoClaimStatus"]),
+                            display(&s["autoClaimAfter"])
+                        ),
+                        MUTED,
+                    ),
+                    (
+                        "Stale / overflow",
+                        format!(
+                            "{} / {}",
+                            display(&s["staleBeforeBroadcast"]),
+                            display(&s["candidateQueueOverflow"])
+                        ),
+                        MUTED,
+                    ),
+                ],
+                ascii,
             );
         } else {
-            let columns =
-                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(rows[2]);
-            let remaining = snapshot["epochEndsAt"]
-                .as_u64()
-                .zip(
-                    snapshot["blockTimestamp"]
-                        .as_str()
-                        .and_then(|v| v.parse::<u64>().ok()),
-                )
-                .map(|(end, time)| {
-                    format!(
-                        "{}s",
-                        end.saturating_sub(
-                            time + self.inspected.map_or(0, |t| t.elapsed().as_secs())
-                        )
-                    )
-                })
-                .unwrap_or_else(|| "N/A".into());
-            let global = vec![
-                row("Epoch", display(&snapshot["currentEpoch"])),
-                row(
-                    "Target",
-                    snapshot["target"]
-                        .as_str()
-                        .and_then(|v| zoru_miner::abi::quantity(v).ok())
-                        .map(|v| short(&format!("{v:#066x}"), ascii))
-                        .unwrap_or_else(|| "N/A".into()),
-                ),
-                row("Epoch proofs", display(&snapshot["currentEpochProofs"])),
-                row(
-                    "Epoch budget",
-                    format!(
-                        "{} ZORU",
-                        amount(&snapshot["currentEpochBudgetBaseUnits"], 8)
+            let block = panel(" SESSION / NETWORK ", ascii);
+            let inner = block.inner(rows[2]);
+            frame.render_widget(block, rows[2]);
+            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
+            render_table(
+                frame,
+                cols[0],
+                vec![
+                    ("Accepted", display(&s["accepted"]), GREEN),
+                    (
+                        "Rejected",
+                        display(&s["rejected"]),
+                        if s["rejected"].as_u64().unwrap_or(0) > 0 {
+                            RED
+                        } else {
+                            MUTED
+                        },
                     ),
-                ),
-                row("Epoch ends", remaining),
-                row("Generation", display(&snapshot["generation"])),
-                row("Seed", short(text(&snapshot["seed"]), ascii)),
-                row("Total proofs", display(&snapshot["totalAcceptedProofs"])),
-                row(
-                    "Snapshot age",
-                    format!("{}s", self.inspected.map_or(0, |t| t.elapsed().as_secs())),
-                ),
-            ];
-            let engine = vec![
-                row("Status", phase.into()),
-                row(
-                    "Workers / CPU",
-                    format!(
-                        "{} / {} cores",
-                        display(&state["workers"]),
-                        display(&state["cpuBudgetCores"])
-                    ),
-                ),
-                row(
-                    "Accepted / rejected",
-                    format!(
-                        "{} / {}",
-                        display(&state["accepted"]),
-                        display(&state["rejected"])
-                    ),
-                ),
-                row(
-                    "Candidate queue",
-                    format!("{} / 64", display(&state["candidateQueueDepth"])),
-                ),
-                row("Pending TX", display(&state["pendingTransactions"])),
-                row("TX pipeline", display(&tx["status"])),
-                row("Auto-claim", display(&state["autoClaimStatus"])),
-                row(
-                    "Stale / overflow",
-                    format!(
-                        "{} / {}",
-                        display(&state["staleBeforeBroadcast"]),
-                        display(&state["candidateQueueOverflow"])
-                    ),
-                ),
-                row(
-                    "Uptime",
-                    format!(
-                        "{:02}:{:02}:{:02}",
-                        uptime / 3600,
-                        uptime / 60 % 60,
-                        uptime % 60
-                    ),
-                ),
-            ];
-            frame.render_widget(
-                Paragraph::new(global).block(panel(" GLOBAL CONTRACT", ascii)),
-                columns[0],
+                    ("Workers", display(&s["workers"]), INK),
+                    ("CPU cores", display(&s["cpuBudgetCores"]), INK),
+                    ("Pending TX", display(&s["pendingTransactions"]), GOLD),
+                ],
+                11,
             );
-            frame.render_widget(
-                Paragraph::new(engine).block(panel(" MINING ENGINE", ascii)),
-                columns[1],
+            render_table(
+                frame,
+                cols[1],
+                vec![
+                    ("Epoch", display(&p["currentEpoch"]), CYAN),
+                    ("Ends in", remaining, INK),
+                    (
+                        "Queue",
+                        format!("{}/64", display(&s["candidateQueueDepth"])),
+                        CYAN,
+                    ),
+                    ("Uptime", uptime, INK),
+                    ("Auto-claim", display(&s["autoClaimAfter"]), GOLD),
+                ],
+                11,
             );
         }
         self.draw_events(frame, rows[3], ascii);
-        let controls = if self.state["status"] == "stopping" {
-            " Stopping safely; signed journals are retained"
-        } else if area.width < 65 {
-            " Q Quit  Arrows/Pg  L Logs  R Refresh"
+        let controls = if s["status"] == "stopping" {
+            Line::styled(
+                " Stopping safely; retaining signing journals",
+                Style::default().fg(GOLD),
+            )
         } else {
-            " Q Quit  Up/Down Scroll  PgUp/PgDn  L Logs  R Refresh view | UTC"
+            Line::from(vec![
+                badge("Q", CYAN),
+                Span::styled(" Quit  ", Style::default().fg(MUTED)),
+                badge(if ascii { "UD" } else { "↑↓" }, MUTED),
+                Span::styled(" Scroll  ", Style::default().fg(MUTED)),
+                badge("L", MUTED),
+                Span::styled(" Logs  ", Style::default().fg(MUTED)),
+                badge("R", MUTED),
+                Span::styled(" Live  / UTC", Style::default().fg(MUTED)),
+            ])
         };
-        frame.render_widget(
-            Paragraph::new(controls).style(Style::default().fg(MUTED)),
-            rows[4],
-        );
+        frame.render_widget(Paragraph::new(controls), rows[4]);
     }
     fn draw_events(&self, frame: &mut Frame<'_>, area: Rect, ascii: bool) {
         let visible = area.height.saturating_sub(2) as usize;
         let end = self.events.len().saturating_sub(self.scroll);
-        let lines: Vec<Line<'_>> = self
+        let mut lines: Vec<Line<'_>> = self
             .events
             .iter()
             .take(end)
@@ -421,13 +504,24 @@ impl View {
                 let color = match e.category.as_str() {
                     "HASHING" | "FOUND" | "ACCEPTED" => GREEN,
                     "CLAIM" => GOLD,
-                    "WARNING" => Color::Yellow,
-                    "ERROR" | "REJECTED" => Color::Red,
+                    "WARNING" => GOLD,
+                    "ERROR" | "REJECTED" => RED,
                     _ => CYAN,
                 };
                 Line::from(vec![
-                    Span::styled(format!(" {}  ", e.time), Style::default().fg(MUTED)),
-                    Span::styled(format!("{:<9} ", e.category), Style::default().fg(color)),
+                    Span::styled(
+                        format!(
+                            " {} ",
+                            if area.width < 65 {
+                                &e.time[3..]
+                            } else {
+                                &e.time
+                            }
+                        ),
+                        Style::default().fg(MUTED),
+                    ),
+                    badge(&format!("{:<8}", e.category), color),
+                    Span::raw(" "),
                     Span::raw(if ascii {
                         e.message.replace('·', "|").replace('…', "...")
                     } else {
@@ -436,21 +530,31 @@ impl View {
                 ])
             })
             .collect();
+        if lines.is_empty() {
+            lines.push(Line::styled(
+                " Waiting for mining events...",
+                Style::default().fg(MUTED),
+            ));
+        }
         frame.render_widget(
             Paragraph::new(lines).block(
                 panel(
                     if self.logs {
-                        " LIVE MINING EVENTS / SCROLL"
+                        " ACTIVITY / SCROLL "
                     } else {
-                        " LIVE MINING EVENTS"
+                        " LIVE ACTIVITY "
                     },
                     ascii,
                 )
-                .border_style(Style::default().fg(if self.logs {
-                    CYAN
-                } else {
-                    MUTED
-                })),
+                .border_style(Style::default().fg(if self.logs { CYAN } else { EDGE }))
+                .title_bottom(Line::styled(
+                    if self.scroll == 0 {
+                        " LIVE ".to_owned()
+                    } else {
+                        format!(" {} events back / R live ", self.scroll)
+                    },
+                    Style::default().fg(if self.scroll == 0 { GREEN } else { GOLD }),
+                )),
             ),
             area,
         );
@@ -461,7 +565,8 @@ fn panel(title: &str, ascii: bool) -> Block<'_> {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(MUTED))
+        .style(Style::default().bg(SURFACE).fg(INK))
+        .border_style(Style::default().fg(EDGE))
         .title(Span::styled(title, Style::default().fg(CYAN)));
     if ascii {
         block.border_set(ratatui::symbols::border::Set {
@@ -478,11 +583,47 @@ fn panel(title: &str, ascii: bool) -> Block<'_> {
         block
     }
 }
-fn row(label: &str, value: String) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {label:<18}"), Style::default().fg(MUTED)),
-        Span::raw(value),
-    ])
+fn badge(label: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default().fg(BG).bg(color).bold(),
+    )
+}
+fn render_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    values: Vec<(&str, String, Color)>,
+    label_width: u16,
+) {
+    let rows = values.into_iter().map(|(label, value, color)| {
+        Row::new(vec![
+            Cell::from(format!(" {label}")).style(Style::default().fg(MUTED)),
+            Cell::from(value).style(Style::default().fg(color).bold()),
+        ])
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(label_width.min(area.width / 2 + 1)),
+                Constraint::Min(1),
+            ],
+        )
+        .column_spacing(1),
+        area,
+    );
+}
+fn details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    values: Vec<(&str, String, Color)>,
+    ascii: bool,
+) {
+    let block = panel(title, ascii);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_table(frame, inner, values, 18);
 }
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("N/A")
@@ -643,5 +784,80 @@ mod tests {
         assert_eq!(amount(&json!("12450000000000000000"), 18), "12.4500");
         assert_eq!(amount(&json!("1"), 8), "0.0000");
         assert_eq!(amount(&Value::Null, 8), "N/A");
+    }
+
+    #[test]
+    fn phone_and_desktop_keep_key_metrics_visible_and_colored() {
+        let mut view = View::default();
+        view.receive(json!({"event":"state","data":{
+            "status":"mining", "chainId":6736, "rpcHealthy":true,
+            "deploymentMode":"mainnet", "address":"0x1234567890123456789012345678901234567890",
+            "hashesPerSecond":517493.0, "accepted":27, "rejected":0,
+            "workers":1, "cpuBudgetCores":0.5, "candidateQueueDepth":4,
+            "pendingTransactions":1, "elapsedSeconds":3601, "autoClaimAfter":50
+        }}));
+        view.receive(json!({"event":"inspection","data":{
+            "nativeBalanceWei":"499856800000000000000", "tokenBalanceBaseUnits":"1250000000",
+            "myRewardsHistoryComplete":true, "myUnclaimedBaseUnits":"250000000",
+            "currentEpoch":"13921"
+        }}));
+        view.push("ACCEPTED", "Proof confirmed in block 11957934");
+        for (width, height) in [(66, 32), (42, 32), (80, 24), (120, 35)] {
+            for ascii in [false, true] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| view.draw(f, ascii)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let screen = (0..height)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for expected in [
+                    "Chain 6736",
+                    "HASHING",
+                    "RPC ONLINE",
+                    "499.8568",
+                    "12.5000",
+                    "2.5000",
+                    "517.49 kH/s",
+                    "Accepted",
+                    "13921",
+                ] {
+                    assert!(
+                        screen.contains(expected),
+                        "{width}x{height} missing {expected}:\n{screen}"
+                    );
+                }
+                assert!(buffer.content().iter().any(|c| c.bg == GREEN && c.fg == BG));
+                assert!(buffer.content().iter().any(|c| c.fg == CYAN));
+                if ascii {
+                    assert!(screen.is_ascii(), "ASCII mode contains Unicode: {screen}");
+                }
+                if !ascii && width == 66 && height == 32 {
+                    let graph: String = (34..65).map(|x| buffer[(x, 11)].symbol()).collect();
+                    assert!(
+                        !graph.chars().any(|c| c.is_ascii_alphabetic()),
+                        "Graph must not retain caption text: {graph}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rate_history_is_bounded_and_ignores_missing_measurements() {
+        let mut view = View::default();
+        for rate in 0..100 {
+            view.sampled = None;
+            view.receive(json!({"event":"state","data":{"hashesPerSecond":rate}}));
+        }
+        assert_eq!(view.rates.len(), 60);
+        assert_eq!(view.rates.front(), Some(&40));
+        view.sampled = None;
+        view.receive(json!({"event":"state","data":{}}));
+        assert_eq!(view.rates.len(), 60);
     }
 }

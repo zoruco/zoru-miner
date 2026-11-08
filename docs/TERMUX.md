@@ -61,6 +61,29 @@ transaction-free check use `zoru-miner-cli mine --dry-run --seconds 30`.
 Android may suspend Termux in the background; a foreground terminal and a
 Termux wake lock can help, subject to the device's battery restrictions.
 
+The dashboard uses colored status badges, balance cards and a rolling graph
+of measured hashrate. Phone screens use two columns; wider terminals show
+network and engine details side by side. `--ascii` keeps all dashboard glyphs
+ASCII and shows a throughput label instead of the graph.
+
+If the dashboard has no colors, check whether the shell or a tmux server
+inherited `NO_COLOR`. Enable colors for just this process with:
+
+```sh
+env -u NO_COLOR zoru-miner-cli mine
+```
+
+To keep the miner available from another Termux terminal:
+
+```sh
+pkg install tmux
+tmux new-session -s zoru-miner 'env -u NO_COLOR zoru-miner-cli mine'
+```
+
+Enter the password at the hidden prompt. Detach with **Ctrl+B**, then **D**.
+Open the running dashboard again with `tmux attach -t zoru-miner`. Pressing
+**Q** stops the miner. Do not start another signing instance while it runs.
+
 Native Android validation covers wallet creation, saved setup, password
 unlocking, mainnet verification and proof receipts. Run the CLI and wallet
 unit tests with:
