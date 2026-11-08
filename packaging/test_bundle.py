@@ -32,6 +32,8 @@ class BundleTests(unittest.TestCase):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('Release fixture: ' + name + '\n')
+        (self.source / 'miner').mkdir()
+        (self.source / 'miner/Cargo.toml').write_text('[package]\nversion = "1.7.0"\n')
         for name in ['zoru-miner-cli', 'zoru-miner-gui', 'zoru-update']:
             path = self.build / "bin" / name
             path.write_bytes(b'fixed executable fixture\n')
@@ -42,7 +44,7 @@ class BundleTests(unittest.TestCase):
         self.write_manifest(fixture=True)
 
     def write_manifest(self, **extra):
-        data = {'chainId': 6736, 'schema': 'zoru-mainnet-suite-1', 'mode': 'mainnet',
+        data = {'chainId': 6736, 'schema': 'zoru-mainnet-suite-1', 'mode': 'mainnet', 'rolloverGraceSeconds': 30,
                 'token': self.token, 'ledger': self.ledger, **extra}
         digest = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         self.manifest.write_text(json.dumps({**data, 'manifestSha256': digest})+'\n')

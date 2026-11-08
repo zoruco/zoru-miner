@@ -54,7 +54,7 @@ An interactive terminal shows a dark dashboard with fixed balances, contract and
 
 Hash workers continue while the single transaction writer submits proofs, tracks receipts, seals epochs and claims rewards. Candidates are bounded and checked against their epoch, seed, generation and target. Workers switch work at epoch changes and stop when work expires, admission closes, the proof limit is reached or RPC validation fails. Locally finding a candidate does not guarantee on-chain acceptance.
 
-The shared engine prepares and authenticates beacons in the background. Its send guard starts at 15 seconds and adapts to 5–15 seconds after three successful proof transactions using measured full transaction duration. Mining can still wait for a new verified epoch or an expired work lease; the CLI and GUI show the reason.
+The shared engine reads one atomic work context and prepares authenticated beacons in the background. Eligible preceding-epoch work remains usable for up to 30 seconds while the next seed is pending. Its send guard starts at 15 seconds and adapts to 5–15 seconds after three successful proof transactions using measured full transaction duration. Mining can still wait for a new verified epoch or an expired work lease; the CLI and GUI show the reason.
 
 The CLI claims eligible rewards automatically once at least 50 accepted proofs remain unclaimed. Set `--auto-claim-after 0` to disable this, or choose another threshold. The threshold does not combine claims into one transaction: each proof still needs its own claim transaction. Queued proofs receive priority between claims, with settlement given a turn after three accepted proofs or when the queue is empty. The desktop uses manual claims.
 

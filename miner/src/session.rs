@@ -436,6 +436,10 @@ impl Session {
             }
             stats.clone()
         };
+        if let Some(work) = self.work.read().unwrap().as_ref() {
+            data["activeWorkEpoch"] = json!(work.epoch);
+            data["activeWorkEndsAt"] = json!(work.end_time);
+        }
         data["inclusionMarginSeconds"] = json!(self.client.inclusion_margin());
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
         data["transactionPipeline"] = self.client.pipeline.lock().unwrap().clone();
@@ -1002,7 +1006,12 @@ impl Session {
             );
             if abi::number(state[6]) == U256::ZERO {
                 let closes = abi::number(state[9]);
-                if U256::from(self.client.now()?) < closes {
+                let nominal_end = self.client.manifest.launch_time
+                    + (proof.epoch + 1) * self.client.manifest.epoch_seconds;
+                let handed_off = closes
+                    == U256::from(nominal_end + self.client.manifest.rollover_grace_seconds)
+                    && self.client.epoch_handed_off(proof.epoch);
+                if U256::from(self.client.now()?) < closes && !handed_off {
                     continue;
                 }
                 match self.client.send(
@@ -1187,7 +1196,8 @@ impl Session {
                         run.stats.lock().unwrap()["rpcHealthy"] = json!(true);
                     }
                     Err(error) => {
-                        *run.work.write().unwrap() = None;
+                        // Hash only until the existing bounded lease expires.
+                        // Transaction signing still requires a fresh snapshot.
                         run.stats.lock().unwrap()["rpcHealthy"] = json!(false);
                         run.error(error, false)
                     }
@@ -1507,6 +1517,7 @@ impl Session {
                 break;
             }
             stats["waitReason"] = json!(self.client.work_wait_reason());
+            stats["beaconPending"] = json!(self.client.pending_beacon_epoch().is_some());
             stats["submissionOpen"] = json!(
                 self.client
                     .submission_deadline()
@@ -1596,6 +1607,10 @@ impl Session {
             });
             stats.clone()
         };
+        if let Some(work) = self.work.read().unwrap().as_ref() {
+            data["activeWorkEpoch"] = json!(work.epoch);
+            data["activeWorkEndsAt"] = json!(work.end_time);
+        }
         data["inclusionMarginSeconds"] = json!(self.client.inclusion_margin());
         data["fees"] = self.client.fees.lock().unwrap().snapshot();
         let requests = self.client.read.request_count()

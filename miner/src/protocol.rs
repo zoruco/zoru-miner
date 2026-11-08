@@ -38,6 +38,7 @@ pub const REORG_WINDOW: u64 = 128;
 const INITIAL_INCLUSION_MARGIN_SECONDS: u64 = 15;
 const MIN_INCLUSION_MARGIN_SECONDS: u64 = 5;
 const WORK_LEASE_SECONDS: u64 = 5;
+const HASH_LEASE_SECONDS: u64 = 15;
 
 #[derive(Default)]
 struct InclusionWindow {
@@ -146,6 +147,7 @@ pub struct Manifest {
     pub owner: Address,
     pub launch_time: u64,
     pub epoch_seconds: u64,
+    pub rollover_grace_seconds: u64,
     pub decimals: u8,
     pub deployment_block_number: String,
     pub drand_chain_hash: String,
@@ -209,6 +211,7 @@ impl Manifest {
         ensure!(
             result.decimals == 8
                 && result.epoch_seconds == 60
+                && result.rollover_grace_seconds == 30
                 && result.drand_chain_hash == DRAND_HASH,
             "Unsupported mining policy"
         );
@@ -361,10 +364,7 @@ impl WorkSnapshot {
     }
     fn pending_beacon_epoch(&self, manifest: &Manifest, margin: u64) -> Option<u64> {
         let age = self.observed.elapsed();
-        if self.work.is_some()
-            || !self.beacon_missing
-            || age >= Duration::from_secs(WORK_LEASE_SECONDS)
-        {
+        if !self.beacon_missing || age >= Duration::from_secs(WORK_LEASE_SECONDS) {
             return None;
         }
         let (epoch, end) = self.epoch_window(manifest)?;
@@ -373,7 +373,7 @@ impl WorkSnapshot {
     }
     fn wait_reason(&self, manifest: &Manifest) -> &'static str {
         let age = self.observed.elapsed();
-        if age >= Duration::from_secs(WORK_LEASE_SECONDS) {
+        if age >= Duration::from_secs(HASH_LEASE_SECONDS) {
             return "stale-work-lease";
         }
         if let Some(end) = self
@@ -420,6 +420,7 @@ pub struct Client {
     native_head: Mutex<(u64, Instant)>,
     validated_work: Mutex<Option<(Work, Address)>>,
     work_snapshot: Mutex<Option<WorkSnapshot>>,
+    work_refresh: Mutex<()>,
     proof_limit: Mutex<U256>,
     inclusion_window: Mutex<InclusionWindow>,
     pub pipeline: Mutex<Value>,
@@ -462,6 +463,7 @@ impl Client {
             native_head: Mutex::new((0, Instant::now())),
             validated_work: Mutex::new(None),
             work_snapshot: Mutex::new(None),
+            work_refresh: Mutex::new(()),
             proof_limit: Mutex::new(U256::ZERO),
             inclusion_window: Mutex::new(InclusionWindow::default()),
             pipeline: Mutex::new(json!({"status":"idle","pending":0})),
@@ -645,6 +647,11 @@ impl Client {
             "Clock policy mismatch"
         );
         ensure!(
+            self.number(d.ledger, "ROLLOVER_GRACE_SECONDS()")?
+                == U256::from(d.rollover_grace_seconds),
+            "Rollover policy mismatch"
+        );
+        ensure!(
             !abi::boolean(&self.call(d.admin, "recoveryRequired()", &[])?)?,
             "Owner recovery is required"
         );
@@ -680,12 +687,12 @@ impl Client {
         Ok(n.try_into()?)
     }
     pub fn work_deadline(&self) -> Option<Instant> {
-        self.deadline(0)
+        self.deadline(0, HASH_LEASE_SECONDS)
     }
     pub fn submission_deadline(&self) -> Option<Instant> {
-        self.deadline(self.inclusion_margin())
+        self.deadline(self.inclusion_margin(), WORK_LEASE_SECONDS)
     }
-    fn deadline(&self, margin: u64) -> Option<Instant> {
+    fn deadline(&self, margin: u64, lease: u64) -> Option<Instant> {
         self.work_snapshot.lock().unwrap().as_ref().and_then(|s| {
             s.work.as_ref().map(|w| {
                 s.observed
@@ -693,7 +700,7 @@ impl Client {
                         w.end_time
                             .saturating_sub(margin)
                             .saturating_sub(s.timestamp)
-                            .min(WORK_LEASE_SECONDS),
+                            .min(lease),
                     )
             })
         })
@@ -717,6 +724,19 @@ impl Client {
             .as_ref()
             .is_some_and(|s| s.settlement_window_open(&self.manifest, reserve))
     }
+    pub(crate) fn epoch_handed_off(&self, epoch: u64) -> bool {
+        self.work_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.observed.elapsed() < Duration::from_secs(WORK_LEASE_SECONDS)
+                    && snapshot
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.epoch > epoch)
+            })
+    }
     pub(crate) fn work_wait_reason(&self) -> &'static str {
         self.work_snapshot
             .lock()
@@ -736,6 +756,10 @@ impl Client {
         Ok(())
     }
     pub fn work(&self, beneficiary: Address) -> Result<Option<Work>> {
+        // A poller and the writer may refresh concurrently. Serialize context
+        // acquisition so a slower old response cannot replace a newer job.
+        // Hash workers never take this lock.
+        let _refresh = self.work_refresh.lock().unwrap();
         let block = self.block()?;
         let height = block["number"].as_str().context("Block height missing")?;
         self.observe_head(abi::quantity(height)?.try_into()?)?;
@@ -790,48 +814,50 @@ impl Client {
         if now < d.launch_time {
             return Ok((None, false));
         }
-        let epoch = (now - d.launch_time) / d.epoch_seconds;
-        let end_time = d.launch_time + (epoch + 1) * d.epoch_seconds;
-        if !mining_window_open(now, end_time, 0) {
-            return Ok((None, false));
-        }
-        if abi::boolean(&self.call_at(d.ledger, "admissionPaused()", &[], height)?)? {
-            return Ok((None, false));
-        }
-        if abi::abi_address(&self.call_at(d.token, "issuer()", &[], height)?)? != d.ledger {
-            return Ok((None, false));
-        }
-        let word = abi::uint(U256::from(epoch));
-        let info = abi::words(&self.call_at(d.ledger, "epochInfo(uint48)", &[word], height)?)?;
-        ensure!(info.len() == 10, "Invalid epoch schema");
-        let limit = *self.proof_limit.lock().unwrap();
-        ensure!(
-            limit > U256::ZERO,
-            "Verify the deployment before requesting work"
-        );
-        if abi::number(info[3]) >= limit || abi::number(info[6]) != U256::ZERO {
-            return Ok((None, false));
-        }
-        // This call also enforces the coordinator's workActive checkpoint.
-        // All reads use the same block, so a boundary cannot mix two epochs.
-        let target = match self.call_at(d.ledger, "targetForEpoch(uint48)", &[word], height) {
-            Ok(value) => abi::scalar(&value)?,
+        let clock_epoch = (now - d.launch_time) / d.epoch_seconds;
+        let response = match self.call_at(d.ledger, "miningWork()", &[], height) {
+            Ok(value) => value,
             Err(error) if work_unavailable(&error) => return Ok((None, false)),
             Err(error) => return Err(error),
         };
-        let generation =
-            abi::scalar(&self.call_at(d.ledger, "moduleGeneration()", &[], height)?)?;
-        // After the first proof the Ledger owns the seed. Clearing the beacon
-        // cache alone does not invalidate an already opened Ledger epoch.
-        let seed = if info[1] != B256::ZERO {
-            info[1]
-        } else {
-            let words =
-                abi::words(&self.call_at(d.beacon, "verifiedSeed(uint48)", &[word], height)?)?;
-            ensure!(words.len() == 1, "Invalid seed response");
-            words[0]
-        };
+        let selected = abi::words(&response)?;
+        ensure!(selected.len() == 7, "Invalid mining work response");
+        let epoch: u64 = abi::number(selected[0]).try_into()?;
+        let end_time: u64 = abi::number(selected[1]).try_into()?;
+        let seed = selected[2];
+        let target = abi::number(selected[3]);
+        let generation = abi::number(selected[4]);
+        ensure!(
+            abi::number(selected[5]) <= U256::from(1) && abi::number(selected[6]) <= U256::from(1),
+            "Invalid mining work flags"
+        );
+        let needs_beacon = selected[5] != B256::ZERO;
+        let active = selected[6] != B256::ZERO;
+        ensure!(
+            epoch == clock_epoch || clock_epoch.checked_sub(1) == Some(epoch),
+            "Invalid rollover epoch"
+        );
+        ensure!(
+            epoch == clock_epoch || needs_beacon,
+            "Rollover work without a pending beacon"
+        );
+        ensure!(
+            end_time <= d.launch_time + (epoch + 1) * d.epoch_seconds + d.rollover_grace_seconds,
+            "Invalid rollover close time"
+        );
+        if !active || !mining_window_open(now, end_time, 0) {
+            return Ok((None, false));
+        }
+        ensure!(
+            *self.proof_limit.lock().unwrap() > U256::ZERO,
+            "Verify the deployment before requesting work"
+        );
+        ensure!(
+            target > U256::ZERO && target <= (U256::MAX >> 16),
+            "Invalid work target"
+        );
         if seed == B256::ZERO {
+            ensure!(needs_beacon, "Missing work seed without a pending beacon");
             return Ok((None, true));
         }
         let work = Work {
@@ -851,13 +877,18 @@ impl Client {
             .as_ref()
             .is_some_and(|(previous, who)| previous == &work && *who == beneficiary)
         {
-            return Ok((Some(work), false));
+            return Ok((Some(work), needs_beacon));
         }
         let nonce = (U256::from(1) << 128) + U256::from(7);
         let expected = abi::words(&self.call_at(
             d.ledger,
             "digestFor(uint48,bytes32,address,uint256)",
-            &[word, seed, abi::address(beneficiary), abi::uint(nonce)],
+            &[
+                abi::uint(U256::from(epoch)),
+                seed,
+                abi::address(beneficiary),
+                abi::uint(nonce),
+            ],
             height,
         )?)?;
         ensure!(
@@ -865,7 +896,7 @@ impl Client {
             "Miner and ledger digest domains differ"
         );
         *self.validated_work.lock().unwrap() = Some((work.clone(), beneficiary));
-        Ok((Some(work), false))
+        Ok((Some(work), needs_beacon))
     }
     pub fn balance(&self, account: Address) -> Result<U256> {
         abi::quantity(
@@ -1127,7 +1158,13 @@ impl Client {
                 };
                 let epoch = signed_mining_epoch(&entry, recipient)?;
                 let epoch_closed = self.now()?
-                    >= self.manifest.launch_time + (epoch + 1) * self.manifest.epoch_seconds;
+                    >= self.manifest.launch_time
+                        + (epoch + 1) * self.manifest.epoch_seconds
+                        + if is_beacon {
+                            0
+                        } else {
+                            self.manifest.rollover_grace_seconds
+                        };
                 let admission_paused =
                     self.number(self.manifest.ledger, "admissionPaused()")? != U256::ZERO;
                 let seed_verified = is_beacon
@@ -1423,7 +1460,8 @@ impl Client {
                         "STALE_WORK: admission paused; retain the signed journal"
                     );
                     ensure!(
-                        self.epoch()? == signed_mining_epoch(&record, to)?,
+                        label != "publish-drand"
+                            || self.epoch()? == signed_mining_epoch(&record, to)?,
                         "STALE_WORK: signed epoch expired; retain the journal for reconciliation"
                     );
                 }
@@ -1508,7 +1546,7 @@ mod tests {
         serde_json::from_value(json!({"schema":"zoru-mainnet-suite-1","chainId":CHAIN,"mode":"mainnet",
             "token":Address::repeat_byte(1),"ledger":Address::repeat_byte(2),"engine":Address::repeat_byte(3),
             "beacon":Address::repeat_byte(4),"admin":Address::repeat_byte(5),"owner":Address::repeat_byte(6),
-            "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
+            "launchTime":1,"epochSeconds":60,"rolloverGraceSeconds":30,"decimals":8,"deploymentBlockNumber":"0x0",
             "drandChainHash":DRAND_HASH,"runtimeCodeHashes":{},"approvedImplementationCodeHashes":{},"manifestSha256":"fixture"})).unwrap()
     }
     #[test]
@@ -1567,7 +1605,7 @@ mod tests {
         });
         assert_eq!(
             snapshot.pending_beacon_epoch(&manifest, INITIAL_INCLUSION_MARGIN_SECONDS),
-            None
+            Some(1)
         );
         assert!(!snapshot.settlement_window_open(&manifest, 20));
         snapshot.beacon_missing = false;
@@ -1626,22 +1664,21 @@ mod tests {
             end_time: 121,
         };
         let block = json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"});
-        let mut info = [B256::ZERO; 10];
-        info[0] = abi::uint(work.target);
-        info[1] = work.seed;
-        info[3] = abi::uint(U256::from(1));
-        info[8] = abi::uint(work.generation);
         let (url, server) = crate::rpc::tests::sequence(vec![
             ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
             ("eth_getBlockByNumber", block.clone()),
-            ("eth_call", encoded(&[B256::ZERO])),
             (
                 "eth_call",
-                encoded(&[abi::address(Address::repeat_byte(2))]),
+                encoded(&[
+                    abi::uint(U256::from(work.epoch)),
+                    abi::uint(U256::from(work.end_time)),
+                    work.seed,
+                    abi::uint(work.target),
+                    abi::uint(work.generation),
+                    B256::ZERO,
+                    abi::uint(U256::from(1)),
+                ]),
             ),
-            ("eth_call", encoded(&info)),
-            ("eth_call", encoded(&[abi::uint(work.target)])),
-            ("eth_call", encoded(&[abi::uint(work.generation)])),
             (
                 "eth_call",
                 encoded(&[pow::digest(
@@ -1663,14 +1700,39 @@ mod tests {
         )
         .unwrap();
         *c.proof_limit.lock().unwrap() = U256::from(u32::MAX);
-        assert_eq!(c.work(beneficiary).unwrap(), Some(work.clone()));
-        assert_eq!(c.work(beneficiary).unwrap(), Some(work));
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| c.work(beneficiary));
+            let second = scope.spawn(|| c.work(beneficiary));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first.unwrap(), Some(work.clone()));
+        assert_eq!(second.unwrap(), Some(work));
+        assert!(c.epoch_handed_off(0));
+        assert!(!c.epoch_handed_off(1));
         assert_eq!(
             c.read.request_count(),
-            9,
+            5,
             "the second read must use the block cache"
         );
-        assert!(c.work_deadline().unwrap() <= Instant::now() + Duration::from_secs(5));
+        assert!(
+            c.work_deadline().unwrap() <= Instant::now() + Duration::from_secs(HASH_LEASE_SECONDS)
+        );
+        {
+            let mut snapshot = c.work_snapshot.lock().unwrap();
+            snapshot.as_mut().unwrap().observed = Instant::now() - Duration::from_secs(6);
+        }
+        assert!(
+            !c.epoch_handed_off(0),
+            "stale snapshots cannot authorize early settlement"
+        );
+        assert!(
+            c.work_deadline().unwrap() > Instant::now(),
+            "short RPC latency must not stop the worker"
+        );
+        assert!(
+            c.submission_deadline().unwrap() <= Instant::now(),
+            "signing retains the stricter freshness bound"
+        );
         // A fresh, valid job keeps hashing inside the signing guard. No RPC
         // is needed to reject a candidate that cannot be included in time.
         {
@@ -1688,45 +1750,39 @@ mod tests {
         server.join().unwrap();
     }
     #[test]
-    fn proof_limits_sealing_and_inactive_issuer_stop_work() {
-        for (sealed, revoked) in [(false, false), (true, false), (false, true)] {
-            let mut info = [B256::ZERO; 10];
-            info[3] = abi::uint(U256::from(if sealed { 0 } else { 5 }));
-            info[6] = abi::uint(U256::from(u8::from(sealed)));
-            let mut responses = vec![
-                ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
-                (
-                    "eth_getBlockByNumber",
-                    json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"}),
-                ),
-                ("eth_call", encoded(&[B256::ZERO])),
-                (
-                    "eth_call",
-                    encoded(&[abi::address(Address::repeat_byte(if revoked {
-                        99
-                    } else {
-                        2
-                    }))]),
-                ),
-            ];
-            if !revoked {
-                responses.push(("eth_call", encoded(&info)));
-            }
-            let (url, server) = crate::rpc::tests::sequence(responses);
-            let dir = tempfile::tempdir().unwrap();
-            let c = Client::new(
-                fixture_manifest(),
-                &url,
-                &url,
-                None,
-                dir.path().join("j"),
-                dir.path().join("r"),
-            )
-            .unwrap();
-            *c.proof_limit.lock().unwrap() = U256::from(5);
-            assert!(c.work(Address::repeat_byte(7)).unwrap().is_none());
-            server.join().unwrap();
-        }
+    fn inactive_atomic_work_never_reaches_the_hashers() {
+        let (url, server) = crate::rpc::tests::sequence(vec![
+            ("eth_chainId", json!(format!("0x{CHAIN:x}"))),
+            (
+                "eth_getBlockByNumber",
+                json!({"number":"0x10","hash":B256::repeat_byte(9),"timestamp":"0x66"}),
+            ),
+            (
+                "eth_call",
+                encoded(&[
+                    abi::uint(U256::from(1)),
+                    abi::uint(U256::from(151)),
+                    B256::ZERO,
+                    B256::ZERO,
+                    abi::uint(U256::from(1)),
+                    B256::ZERO,
+                    B256::ZERO,
+                ]),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let c = Client::new(
+            fixture_manifest(),
+            &url,
+            &url,
+            None,
+            dir.path().join("j"),
+            dir.path().join("r"),
+        )
+        .unwrap();
+        *c.proof_limit.lock().unwrap() = U256::from(5);
+        assert!(c.work(Address::repeat_byte(7)).unwrap().is_none());
+        server.join().unwrap();
     }
 
     #[test]

@@ -67,7 +67,7 @@ fn generation_progressed(states: &[Value], generation: &str) -> bool {
 fn resumed_after_thaw(states: &[Value]) -> bool {
     let hashes: Vec<u64> = states
         .iter()
-        .filter(|s| s["status"] == "mining" && s["elapsedSeconds"].as_f64().unwrap_or(0.0) >= 8.0)
+        .filter(|s| s["status"] == "mining" && s["elapsedSeconds"].as_f64().unwrap_or(0.0) >= 20.0)
         .filter_map(|s| s["hashes"].as_u64())
         .collect();
     hashes.len() >= 2 && hashes.last() > hashes.first()
@@ -366,7 +366,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
     let thaw_states = states.clone();
     let thaw_stop = session.stop.clone();
     let thaw = thread::spawn(move || {
-        thread::sleep(Duration::from_secs(8));
+        thread::sleep(Duration::from_secs(19));
         storage::atomic_json(&thawed, &json!({})).unwrap();
         while !thaw_stop.load(Ordering::Relaxed) {
             if resumed_after_thaw(&thaw_states.lock().unwrap()) {
@@ -395,7 +395,7 @@ fn hashing_continues_during_receipts_claims_rollover_and_recovers_from_outage() 
         .iter()
         .filter(|s| {
             s["status"] == "waiting-beacon-or-recovery"
-                && (5.0..8.0).contains(&s["elapsedSeconds"].as_f64().unwrap_or(0.0))
+                && (16.0..19.0).contains(&s["elapsedSeconds"].as_f64().unwrap_or(0.0))
         })
         .collect();
     assert!(

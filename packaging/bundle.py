@@ -28,7 +28,8 @@ def main():
             raise ValueError('Expected token and ledger must be nonzero EVM addresses')
     manifest = json.loads(Path(args.manifest).read_text())
     if (not isinstance(manifest, dict) or manifest.get('chainId') != 6736
-            or manifest.get('schema') != 'zoru-mainnet-suite-1' or manifest.get('mode') != 'mainnet'):
+            or manifest.get('schema') != 'zoru-mainnet-suite-1' or manifest.get('mode') != 'mainnet'
+            or manifest.get('rolloverGraceSeconds') != 30):
         raise ValueError('Only a verified ZORU mainnet manifest is packageable')
     for role, expected in (('token', args.expected_token), ('ledger', args.expected_ledger)):
         actual = manifest.get(role)
@@ -57,7 +58,12 @@ def main():
     for name in ['LICENSE', 'README.md', 'SECURITY.md', 'CONTRIBUTING.md']:
         shutil.copy2(ROOT/name, out/name)
     shutil.copytree(ROOT/'licenses', out/'licenses')
-    shutil.copytree(ROOT/'docs', out/'docs')
+    version = re.search(r'^version = "([^"]+)"', (ROOT/'miner/Cargo.toml').read_text(), re.MULTILINE)
+    if not version:
+        raise ValueError('Package source version is missing')
+    current_notes = 'RELEASE-' + version.group(1) + '.md'
+    shutil.copytree(ROOT/'docs', out/'docs', ignore=lambda directory, names:
+                    [name for name in names if name.startswith('RELEASE-') and name != current_notes])
     shutil.copy2(ROOT/'packaging/install.py', out/'install.py')
     (out/'share/zoru-miner').mkdir(parents=True)
     shutil.copy2(args.manifest, out/'share/zoru-miner/deployment.json')

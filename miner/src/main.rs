@@ -873,7 +873,7 @@ mod tests {
             "token":Address::repeat_byte(1),"ledger":Address::repeat_byte(2),
             "engine":Address::repeat_byte(3),"beacon":Address::repeat_byte(4),
             "admin":Address::repeat_byte(5),"owner":Address::repeat_byte(6),
-            "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
+            "launchTime":1,"epochSeconds":60,"rolloverGraceSeconds":30,"decimals":8,"deploymentBlockNumber":"0x0",
             "drandChainHash":zoru_miner::protocol::DRAND_HASH,
             "runtimeCodeHashes":{},"approvedImplementationCodeHashes":{}
         });

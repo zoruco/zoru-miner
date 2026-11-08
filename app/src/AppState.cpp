@@ -1294,7 +1294,7 @@ void AppState::applyMinerEvent(const QJsonObject &event) {
     else if (phase == "waiting-beacon-or-recovery") {
         const auto reason = data.value("waitReason").toString();
         if (reason == "epoch-safety-window")
-            m_miningStatus = QString("Epoch ending · %1s send guard").arg(data.value("inclusionMarginSeconds").toInt(15));
+            m_miningStatus = "Work epoch expired";
         else if (reason == "stale-work-lease")
             m_miningStatus = "Refreshing expired work lease";
         else if (reason == "awaiting-beacon")

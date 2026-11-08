@@ -123,7 +123,7 @@ class AppStateTest final : public QObject {
         state.applyMinerEvent({{"event", "state"}, {"data", QJsonObject{
             {"status", "waiting-beacon-or-recovery"}, {"hashesPerSecond", 0},
             {"waitReason", "epoch-safety-window"}, {"inclusionMarginSeconds", 7}}}});
-        QCOMPARE(state.miningStatus(), QString("Epoch ending · 7s send guard"));
+        QCOMPARE(state.miningStatus(), QString("Work epoch expired"));
         QCOMPARE(state.hashrateValue(), QString("0"));
         QCOMPARE(state.hashrateUnit(), QString("H/s"));
         QCOMPARE(state.hashrateSamples().size(), 2);

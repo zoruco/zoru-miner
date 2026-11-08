@@ -385,7 +385,34 @@ impl View {
             );
             rate_graph(frame, plot, &data, ascii);
         }
-        let remaining = p["epochEndsAt"]
+        let context = s["contexts"]
+            .as_array()
+            .and_then(|contexts| contexts.last());
+        let target = context
+            .and_then(|work| work["target"].as_str())
+            .and_then(|value| value.parse::<alloy_primitives::U256>().ok())
+            .or_else(|| {
+                p["target"]
+                    .as_str()
+                    .and_then(|value| zoru_miner::abi::quantity(value).ok())
+            });
+        let seed = context
+            .and_then(|work| work.get("seed"))
+            .unwrap_or(&p["seed"]);
+        let generation = context
+            .and_then(|work| work.get("generation"))
+            .unwrap_or(&p["generation"]);
+        let work_epoch = if s["activeWorkEpoch"].is_number() {
+            &s["activeWorkEpoch"]
+        } else {
+            &p["currentEpoch"]
+        };
+        let end = if s["activeWorkEndsAt"].is_number() {
+            &s["activeWorkEndsAt"]
+        } else {
+            &p["epochEndsAt"]
+        };
+        let remaining = end
             .as_u64()
             .zip(
                 p["blockTimestamp"]
@@ -407,32 +434,25 @@ impl View {
                 cols[0],
                 " NETWORK / EPOCH ",
                 vec![
-                    ("Epoch", display(&p["currentEpoch"]), CYAN),
+                    ("Work epoch", display(work_epoch), CYAN),
                     (
                         "Target",
-                        p["target"]
-                            .as_str()
-                            .and_then(|v| zoru_miner::abi::quantity(v).ok())
+                        target
                             .map(|v| short(&format!("{v:#066x}"), ascii))
                             .unwrap_or("N/A".into()),
                         MUTED,
                     ),
-                    ("Epoch proofs", display(&p["currentEpochProofs"]), INK),
+                    ("Chain proofs", display(&p["currentEpochProofs"]), INK),
                     (
-                        "Epoch budget",
+                        "Chain budget",
                         format!("{} ZORU", amount(&p["currentEpochBudgetBaseUnits"], 8)),
                         GOLD,
                     ),
                     ("Time remaining", remaining, INK),
-                    ("Generation", display(&p["generation"]), INK),
-                    ("Seed", short(text(&p["seed"]), ascii), MUTED),
+                    ("Generation", display(generation), INK),
+                    ("Seed", short(text(seed), ascii), MUTED),
                     ("Total proofs", display(&p["totalAcceptedProofs"]), INK),
-                    (
-                        "Snapshot age",
-                        self.inspected
-                            .map_or("N/A".into(), |t| format!("{}s", t.elapsed().as_secs())),
-                        MUTED,
-                    ),
+                    ("Chain epoch", display(&p["currentEpoch"]), MUTED),
                 ],
                 ascii,
             );
@@ -519,7 +539,7 @@ impl View {
                 frame,
                 cols[1],
                 vec![
-                    ("Epoch", display(&p["currentEpoch"]), CYAN),
+                    ("Work epoch", display(work_epoch), CYAN),
                     ("Ends in", remaining, INK),
                     (
                         "Queue",

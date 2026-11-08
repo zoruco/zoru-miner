@@ -18,7 +18,7 @@ fn test_manifest(directory: &std::path::Path) -> std::path::PathBuf {
         "beacon":"0x4444444444444444444444444444444444444444",
         "admin":"0x5555555555555555555555555555555555555555",
         "owner":"0x6666666666666666666666666666666666666666",
-        "launchTime":1,"epochSeconds":60,"decimals":8,"deploymentBlockNumber":"0x0",
+        "launchTime":1,"epochSeconds":60,"rolloverGraceSeconds":30,"decimals":8,"deploymentBlockNumber":"0x0",
         "drandChainHash":zoru_miner::protocol::DRAND_HASH,
         "runtimeCodeHashes":{},"approvedImplementationCodeHashes":{}
     });

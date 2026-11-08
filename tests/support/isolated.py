@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--gui-build', type=Path)
     parser.add_argument('--tests', nargs='*', default=['recovery', 'mining_limit', 'automatic_claim', 'claim_reorg', 'continuous'])
     parser.add_argument('--terminal', action='store_true')
+    parser.add_argument('--delayed-beacon', action='store_true', help='Use a TEST ONLY twenty-second seed delay')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     output = args.output.resolve()
@@ -123,7 +124,7 @@ def main():
         admin = deploy('ZoruAdminAdapter', 'ZoruAdminAdapter', 'constructor(address)', token)
         ledger_impl = deploy('ZoruLedger', 'ZoruLedger')
         engine_impl = deploy('ZoruKeccakEngine', 'ZoruKeccakEngine')
-        beacon_impl = deploy('DeepTestHarness', 'DeepTestBeacon')
+        beacon_impl = deploy('DeepTestHarness', 'DeepTestDelayedBeacon' if args.delayed_beacon else 'DeepTestBeacon')
         launch = int(rpc('eth_getBlockByNumber', ['latest', False])['timestamp'], 16)+20
         deployment = (f'({ledger_impl},{engine_impl},{calldata("initialize()")},'
                       f'{beacon_impl},{calldata("initialize(uint256)", launch)},'
@@ -139,7 +140,7 @@ def main():
 
         manifest = dict(schema='zoru-mainnet-suite-1', mode='local', chainId=6736,
                         token=token, ledger=ledger, engine=engine, beacon=beacon, admin=admin,
-                        owner=owner, launchTime=launch, epochSeconds=60, decimals=8,
+                        owner=owner, launchTime=launch, epochSeconds=60, rolloverGraceSeconds=30, decimals=8,
                         deploymentBlockNumber='0x0',
                         drandChainHash='04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3',
                         runtimeCodeHashes={k: codehash(v) for k, v in dict(
