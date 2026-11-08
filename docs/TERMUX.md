@@ -67,8 +67,8 @@ history graph. New samples arrive at the right edge. Phone screens use two colum
 wider terminals show network and engine details side by side. `--ascii`
 uses ASCII glyphs for borders and the trend graph. Uptime appears once in
 the session panel. The main activity feed focuses on epoch changes,
-transactions, warnings and confirmed proofs. On tall screens the main feed
-stays compact. Press **L** to expand it and show candidate details.
+transactions, warnings and confirmed proofs. The activity panel fills all
+remaining screen space above the footer. Press **L** to show candidate details.
 Long messages wrap to keep RPC reasons readable; identical warnings
 or errors share one row with an occurrence count. Hashing and queue
 transitions already appear in live metrics. Raw JSON output from `--plain`

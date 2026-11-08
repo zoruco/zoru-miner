@@ -206,11 +206,7 @@ impl View {
         let available = area
             .height
             .saturating_sub(header_height + metrics_height + details_height + 1);
-        let activity_height = if self.logs {
-            available
-        } else {
-            available.min(14)
-        };
+        let activity_height = available;
         let rows = Layout::vertical([
             Constraint::Length(header_height),
             Constraint::Length(metrics_height),
@@ -974,7 +970,8 @@ mod tests {
                         );
                     }
                     if height == 63 {
-                        assert_eq!(buffer[(0, 50)].symbol(), " ");
+                        assert_eq!(buffer[(0, 50)].symbol(), "│");
+                        assert_eq!(buffer[(0, 61)].symbol(), "╰");
                     }
                     let graph: String = (1..65).map(|x| buffer[(x, 13)].symbol()).collect();
                     assert!(
