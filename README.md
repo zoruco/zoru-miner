@@ -27,6 +27,8 @@ See the [App Guide](docs/APP_GUIDE.md) for setup, mining and updates.
 
 ## Command line
 
+For native Android installation and wallet setup, see the [Termux guide](docs/TERMUX.md).
+
 Use an existing encrypted Web3 version 3 wallet and the reviewed manifest included with the release. Keep your wallet backup and state directory between runs. Start with the guided setup:
 
 ```sh
